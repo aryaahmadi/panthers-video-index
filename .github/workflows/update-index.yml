@@ -1,0 +1,51 @@
+name: Update video index
+
+on:
+  schedule:
+    - cron: "0 11 * * *"   # daily 11:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-index
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out main (builder code)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Check out gh-pages (published data) into site/
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: site
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Build index (merge into the published videos.json)
+        run: python3 build-index.py --existing site/videos.json --out site/videos.json
+
+      - name: Commit and push to gh-pages if changed
+        working-directory: site
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git diff --quiet -- videos.json || (
+            git add videos.json &&
+            git commit -m "Update video index ($(date -u +%Y-%m-%d))" &&
+            git push origin gh-pages
+          )

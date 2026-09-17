@@ -1,0 +1,14 @@
+# python
+__pycache__/
+*.pyc
+
+# builder scratch / local runs
+*.tmp
+*.gz
+site/
+sitemap-video-*.xml
+
+# os / editors
+.DS_Store
+.vscode/
+.idea/
