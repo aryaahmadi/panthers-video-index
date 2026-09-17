@@ -7,13 +7,14 @@ unit, so a title, description, thumbnail, date and tags always belong to the sam
 
 Usage:
     python3 build-index.py [--existing videos.json] [--out videos.json] [--no-verify]
-                           [--sitemaps-dir DIR] [--max-drop N] [--workers N]
+                           [--sitemaps-dir DIR] [--from-scratch] [--max-drop N] [--workers N]
 
 Merge rules (see README.md):
   * sitemap data wins for every video that is in a sitemap;
   * videos in the existing index but absent from the sitemaps are KEPT unless a HEAD/GET check
     says the page is gone (404 / 410, or a redirect to the /video/ listing page, which is how
-    panthers.com answers unknown slugs);
+    panthers.com answers unknown slugs). Because of this, a missing --existing file is an error
+    (exit 2) unless --from-scratch is given: silently starting over would drop those videos;
   * an existing v1 index (bare array of {title,url,date,thumb,desc}) is migrated to v2; v1-only
     entries have their thumbnail + description re-read from the video page's og: tags because the
     v1 desc/thumb fields were misaligned.
@@ -27,6 +28,7 @@ import glob
 import gzip
 import html
 import json
+from html.parser import HTMLParser
 import os
 import re
 import sys
@@ -93,12 +95,11 @@ THUMB_RE = re.compile(
 )
 LISTING_ROOT_RE = re.compile(r"^(?:https?://(?:www\.)?panthers\.com)?/video/?(?:[?#].*)?$", re.I)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
-OG_RE_A = re.compile(
-    r"<meta\b[^>]*?(?:property|name)\s*=\s*[\"']og:(image|description)[\"'][^>]*?"
-    r"content\s*=\s*[\"']([^\"']*)[\"']", re.I | re.S)
-OG_RE_B = re.compile(
-    r"<meta\b[^>]*?content\s*=\s*[\"']([^\"']*)[\"'][^>]*?"
-    r"(?:property|name)\s*=\s*[\"']og:(image|description)[\"']", re.I | re.S)
+# CMS markup that survives entity decoding: 3<sup>rd</sup>, <a href=...>. Inline tags are removed
+# without a space ("3rd", not "3 rd"); every other tag becomes a space so words do not run together.
+INLINE_TAG_RE = re.compile(r"</?(?:sup|sub|b|i|em|strong|u|span|small)\b[^>]*>", re.I)
+TAG_RE = re.compile(r"</?[A-Za-z][^>]*>")
+OG_KEYS = {"og:image": "image", "og:description": "description"}
 
 
 # --------------------------------------------------------------------------------------------
@@ -106,11 +107,12 @@ OG_RE_B = re.compile(
 # --------------------------------------------------------------------------------------------
 
 def collapse(text: Optional[str]) -> str:
-    """CDATA-unwrap, XML/HTML-unescape, NBSP -> space, collapse whitespace, strip."""
+    """CDATA-unwrap, XML/HTML-unescape, strip HTML tags, NBSP -> space, collapse whitespace, strip."""
     if not text:
         return ""
     text = CDATA_RE.sub(r"\1", text)
     text = html.unescape(text)
+    text = TAG_RE.sub(" ", INLINE_TAG_RE.sub("", text))  # tags only exist after unescaping (&lt;sup&gt; in the XML)
     return WS_RE.sub(" ", text).strip()
 
 
@@ -346,6 +348,39 @@ def check_alive(session: requests.Session, url: str) -> str:
         return "error"
 
 
+class OgMetaParser(HTMLParser):
+    """Collects og:image / og:description from <meta> tags (first occurrence wins).
+
+    A real HTML parser instead of a regex: a double-quoted content attribute that contains an
+    apostrophe ("... after Wednesday's practice ...") is read up to its closing double quote,
+    where a [\"']([^\"']*)[\"'] regex stopped at the apostrophe. Entities are decoded by the parser.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.og: Dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # HTMLParser also routes <meta ... /> here
+        if tag != "meta":
+            return
+        a = {(k or "").lower(): (v or "") for k, v in attrs}
+        for name_attr in ("property", "name"):
+            key = OG_KEYS.get(a.get(name_attr, "").strip().lower())
+            if key:
+                self.og.setdefault(key, a.get("content", ""))
+                return
+
+
+def parse_og(page: str) -> Dict[str, str]:
+    p = OgMetaParser()
+    try:
+        p.feed(page)
+        p.close()
+    except Exception:  # malformed markup: keep whatever was collected before the error
+        pass
+    return p.og
+
+
 def hydrate(session: requests.Session, url: str) -> Tuple[str, str, str]:
     """GET the video page; returns (status, og_image, og_description). status: ok | gone | error."""
     try:
@@ -359,12 +394,7 @@ def hydrate(session: requests.Session, url: str) -> Tuple[str, str, str]:
             return "gone", "", ""
     if r.status_code >= 400:
         return "error", "", ""
-    page = r.content.decode("utf-8", "replace")
-    og: Dict[str, str] = {}
-    for key, val in OG_RE_A.findall(page):
-        og.setdefault(key.lower(), html.unescape(val))
-    for val, key in OG_RE_B.findall(page):
-        og.setdefault(key.lower(), html.unescape(val))
+    og = parse_og(r.content.decode("utf-8", "replace"))
     return "ok", og.get("image", "").strip(), og.get("description", "")
 
 
@@ -420,16 +450,31 @@ def dumps(obj) -> str:
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Build / refresh the Panthers video index (format v2).")
-    ap.add_argument("--existing", default="videos.json", help="existing index to merge into (v1 or v2); default videos.json")
+    ap.add_argument("--existing", default="videos.json",
+                    help="existing index to merge into (v1 or v2); default videos.json. Must exist unless --from-scratch is given")
     ap.add_argument("--out", default="videos.json", help="output path; default videos.json")
     ap.add_argument("--no-verify", action="store_true",
                     help="keep entries missing from the sitemaps without checking them (no HEAD/GET, no og: hydration)")
     ap.add_argument("--sitemaps-dir", default=None,
                     help="read sitemap-video-*.xml from this directory instead of fetching them")
+    ap.add_argument("--from-scratch", action="store_true",
+                    help="build from the sitemaps alone, ignoring --existing. Without this flag a missing --existing "
+                         "file is an error (exit 2), because building without it would silently drop every video "
+                         "that is no longer in the sitemaps")
     ap.add_argument("--max-drop", type=int, default=50,
                     help="refuse to write if more than N existing entries would be dropped (default 50)")
     ap.add_argument("--workers", type=int, default=20, help="concurrent HEAD/GET checks (default 20)")
     args = ap.parse_args(argv)
+
+    if args.from_scratch:
+        args.existing = None
+    elif not args.existing or not os.path.isfile(args.existing):
+        print("error: existing index %r not found. Building without it would drop every video that is no "
+              "longer in the sitemaps (merging into the published index is the whole point of this script).\n"
+              "  Put the published file there first:  git show origin/gh-pages:videos.json > videos.json\n"
+              "  or pass --from-scratch to build a fresh, sitemap-only index on purpose."
+              % args.existing, file=sys.stderr)
+        return 2
 
     t0 = time.time()
     session = make_session(max(1, args.workers))
@@ -467,8 +512,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if existing:
         print("Existing index: %s (%d entries, format v%d)"
               % (args.existing, len(existing_by_slug), 1 if existing[0][1] else 2))
+    elif args.from_scratch:
+        print("Existing index: none (--from-scratch) - building from the sitemaps alone")
     else:
-        print("Existing index: none (%s not found) - building from scratch" % args.existing)
+        print("Existing index: %s has no entries - building from the sitemaps alone" % args.existing)
 
     new = updated = changed = 0
     for e in sitemap_entries:
