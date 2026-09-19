@@ -1,7 +1,7 @@
 # panthers-video-index
 
 A searchable index of every video on [panthers.com/video](https://www.panthers.com/video/), rebuilt
-daily from the site's video sitemaps and published as one static JSON file. It is the data source
+hourly from the site's video sitemaps and published as one static JSON file. It is the data source
 for the Panthers video search widget (the `search` project) and can be consumed by anything else
 that wants a list of Panthers videos with titles, dates, thumbnails, descriptions and tags.
 
@@ -145,15 +145,21 @@ What it does:
 5. Sorts, writes compact JSON and prints per-sitemap counts, new / updated / kept / dropped
    counts, the total and the raw + gzip size. Output is deterministic - if nothing changed the file
    is byte-identical (the `generated` timestamp is only bumped when the video list changed), so the
-   daily Action only commits real changes.
+   hourly Action only commits real changes.
 
 ## Automation
 
-`.github/workflows/update-index.yml` runs daily at 11:00 UTC and on manual dispatch
+`.github/workflows/update-index.yml` runs hourly (at :17 past the hour) and on manual dispatch
 (Actions tab -> "Update video index" -> "Run workflow"). It installs `requests`, runs
 `python3 build-index.py --existing site/videos.json --out site/videos.json` and commits + pushes
 `site/videos.json` to `gh-pages` with the built-in `GITHUB_TOKEN` (`permissions: contents: write`)
 only when `git diff` reports a change. GitHub Pages redeploys on push; the CDN cache is 10 minutes.
+
+Two things bound freshness: GitHub can start scheduled jobs late (runs meant for 11:00 UTC started
+3-4 hours late in September 2026), and the site's fast-changing sitemap itself can lag a new video by
+hours. So the widget does not rely on this index alone: on panthers.com it also reads
+`/sitemap-video-fast-changing.xml` (same origin) at page load and merges the newest ~100 videos in,
+with the same parsing rules as `build-index.py`. A new video is searchable as soon as the site lists it.
 
 ## Consumer
 

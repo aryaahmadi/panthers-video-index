@@ -2,7 +2,7 @@ name: Update video index
 
 on:
   schedule:
-    - cron: "0 11 * * *"   # daily 11:00 UTC
+    - cron: "17 * * * *"   # hourly, at :17 (GitHub delays jobs scheduled on the hour); no-change runs commit nothing
   workflow_dispatch:
 
 permissions:
