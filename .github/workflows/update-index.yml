@@ -1,4 +1,4 @@
-name: Update video index
+name: Update video and photo index
 
 on:
   schedule:
@@ -33,19 +33,64 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Install dependencies
         run: pip install requests
 
-      - name: Build index (merge into the published videos.json)
+      # The two builds are independent: when one fails, the other is still published (the failed one's file is put
+      # back as published before the commit, so a half-written file is never pushed) and the last step fails the run.
+      - name: Build video index (merge into the published videos.json)
+        id: videos
+        continue-on-error: true
         run: python3 build-index.py --existing site/videos.json --out site/videos.json
+
+      - name: Build photo index (merge into the published photos.json)
+        id: photos
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          set +e
+          # timeout stops the builder itself before the step's own limit, which only signals this shell: a builder
+          # left running could otherwise write photos.json while the commit step runs.
+          timeout -k 30s 14m node photo-builder/tools/build-photo-index.js --out site/photos.json
+          code=$?
+          # 2: some gallery pages could not be read. The file is complete: those galleries keep what the index
+          # knew (a new one is written without tags/people) and are read again next run.
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::Some gallery pages could not be read (see this step's log); they are retried next run."
+            code=0
+          fi
+          exit "$code"
 
       - name: Commit and push to gh-pages if changed
         working-directory: site
+        env:
+          VIDEOS: ${{ steps.videos.outcome }}
+          PHOTOS: ${{ steps.photos.outcome }}
         run: |
+          # A failed build's file goes back to the published one (or away, if it was never published).
+          restore() { if git ls-files --error-unmatch -- "$1" >/dev/null 2>&1; then git checkout -- "$1"; else rm -f -- "$1"; fi; }
+          [ "$VIDEOS" = success ] || restore videos.json
+          [ "$PHOTOS" = success ] || restore photos.json
+          changed="" files=""
+          if ! git diff --quiet -- videos.json; then changed="video"; files="videos.json"; fi
+          if ! git diff --quiet -- photos.json; then changed="${changed:+$changed and }photo"; files="$files photos.json"; fi
+          [ -n "$changed" ] || exit 0
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git diff --quiet -- videos.json || (
-            git add videos.json &&
-            git commit -m "Update video index ($(date -u +%Y-%m-%d))" &&
-            git push origin gh-pages
-          )
+          git add $files
+          git commit -m "Update $changed index ($(date -u +%Y-%m-%d))"
+          git push origin gh-pages
+
+      - name: Fail the run if a build failed
+        if: steps.videos.outcome == 'failure' || steps.photos.outcome == 'failure'
+        env:
+          VIDEOS: ${{ steps.videos.outcome }}
+          PHOTOS: ${{ steps.photos.outcome }}
+        run: |
+          echo "::error::video build: $VIDEOS, photo build: $PHOTOS. A failed build published nothing; see its step's log."
+          exit 1
