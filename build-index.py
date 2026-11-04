@@ -575,8 +575,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                      % (len(dropped), args.max_drop, args.out))
 
     # 4. assemble, sort, write ---------------------------------------------------------------
-    # Python's sort is stable even with reverse=True, so ties keep sitemap order (kept entries after).
-    videos = sorted(sitemap_entries + kept, key=lambda e: e["date"], reverse=True)
+    # Same-day videos: the sitemaps list them in a different order each time panthers.com regenerates them, so
+    # the ones the index already holds keep their order in it and new ones come first, in sitemap order.
+    # Otherwise a run that found nothing new could still reorder, and rewrite, the file. Python's sort is stable
+    # even with reverse=True, so sorting by that rank first and then by date leaves each day in rank order.
+    prev_pos: Dict[str, int] = {}
+    for i, (entry, _) in enumerate(existing):
+        prev_pos.setdefault(entry["slug"], i)
+    videos = sitemap_entries + kept
+    rank = {e["slug"]: len(videos) + prev_pos[e["slug"]] if e["slug"] in prev_pos else i
+            for i, e in enumerate(videos)}
+    videos.sort(key=lambda e: rank[e["slug"]])
+    videos.sort(key=lambda e: e["date"], reverse=True)
     videos_json = dumps(videos)
 
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

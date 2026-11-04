@@ -45,7 +45,11 @@ back to `gh-pages` only when their content changed.
 }
 ```
 
-* `videos` is sorted by `date` descending; ties keep sitemap order (newest sitemap first).
+* `videos` is sorted by `date` descending. Among videos with the same date, the ones already in
+  the index keep their previous order and new ones go first, in sitemap order (newest sitemap
+  first). panthers.com lists same-date videos in a different order each time it regenerates the
+  sitemaps, and following it would rewrite the file on runs that found nothing new. A
+  `--from-scratch` build uses sitemap order.
 * `slug` - the path after `/video/`. Full page URL = `base.url + slug`.
 * `date` - `YYYY-MM-DD` publication date.
 * `thumb` - `"upload/<id>"` or `"private/<id>"`: the Cloudinary delivery type and public id of the
@@ -148,8 +152,8 @@ What it does:
    old thumbnail with no description.
 5. Sorts, writes compact JSON and prints per-sitemap counts, new / updated / kept / dropped
    counts, the total and the raw + gzip size. Output is deterministic - if nothing changed the file
-   is byte-identical (the `generated` timestamp is only bumped when the video list changed), so the
-   hourly Action only commits real changes.
+   is byte-identical (the `generated` timestamp is only bumped when the video list changed, and
+   same-date videos keep their order, see above), so the hourly Action only commits real changes.
 
 ## Photo index (`photos.json`)
 
