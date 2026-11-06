@@ -13,13 +13,15 @@ header search (see [Site index](#site-index-sitejson-site-gotojson)).
 `https://aryaahmadi.github.io/panthers-video-index/photos.json`,
 `https://aryaahmadi.github.io/panthers-video-index/site.json` and
 `https://aryaahmadi.github.io/panthers-video-index/site-goto.json`
-(GitHub Pages, `Access-Control-Allow-Origin: *`, `Cache-Control: max-age=600`, ETag, gzip.)
+(GitHub Pages, `Access-Control-Allow-Origin: *`, `Cache-Control: max-age=600`, ETag, gzip.) The same four files are
+also served from Cloudflare (see [Cloudflare](#cloudflare)), which the widgets read first; GitHub Pages is their
+fall-back.
 
 ## Repository layout
 
 | Branch     | Contents                                                                              |
 |------------|---------------------------------------------------------------------------------------|
-| `main`     | Code: `build-index.py`, `photo-builder/`, `site-builder/`, the GitHub Action, this README. |
+| `main`     | Code: `build-index.py`, `photo-builder/`, `site-builder/`, `cloudflare/`, the GitHub Action, this README. |
 | `gh-pages` | Data: `videos.json`, `photos.json`, `site.json`, `site-goto.json`. GitHub Pages serves this branch. |
 
 The two branches never share files. The Action checks out `main` for the code and `gh-pages`
@@ -294,6 +296,29 @@ Two things bound freshness: GitHub can start scheduled jobs late (runs meant for
 hours. So the widget does not rely on this index alone: on panthers.com it also reads
 `/sitemap-video-fast-changing.xml` (same origin) at page load and merges the newest ~100 videos in,
 with the same parsing rules as `build-index.py`. A new video is searchable as soon as the site lists it.
+
+## Cloudflare
+
+`cloudflare/wrangler.jsonc` is a Worker named `panthers-search-data` with static assets only (no script runs, so
+requests to it are free and not capped, unlike GitHub Pages' soft limit of 100 GB a month), on the Cloudflare
+account of arya.ahmadi@panthers.nfl.com. `cloudflare/_headers` gives every file `Access-Control-Allow-Origin: *`
+and `Cache-Control: public, max-age=600`; Cloudflare's ETag changes only when a file's content does, so a
+returning visitor's check of an unchanged file is a 304 (GitHub Pages gives all four files new validators on
+every deploy).
+
+The Action's step "Deploy the published files to Cloudflare" runs after the gh-pages push, every run: it copies
+the four files from `site/` and `cloudflare/_headers` into `dist/` and runs `npx wrangler deploy` in `cloudflare/`
+(only changed files are uploaded). It needs the repository secret `CLOUDFLARE_API_TOKEN`: in Cloudflare, My
+Profile -> API Tokens -> Create Token -> template "Edit Cloudflare Workers", limited to this account; then in
+GitHub, this repository -> Settings -> Secrets and variables -> Actions -> New repository secret. Without the
+secret the step only warns (and Cloudflare keeps the files of the last deploy, so set it before pointing the
+widgets there); a failed deploy fails the run.
+
+By hand, from a clone (with `npx wrangler login` done once):
+
+```bash
+rm -rf dist && mkdir dist && for f in videos.json photos.json site.json site-goto.json; do git show origin/gh-pages:$f > dist/$f; done && cp cloudflare/_headers dist/ && (cd cloudflare && npx --yes wrangler@4.158.0 deploy)
+```
 
 ## Consumer
 

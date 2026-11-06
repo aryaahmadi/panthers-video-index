@@ -1,0 +1,6 @@
+# Sent with every file: any site may read the indexes (they are public); cached 10 minutes, as on GitHub Pages,
+# then revalidated (Cloudflare's ETag changes only when a file's content does, so an unchanged file costs a 304).
+/*
+  Access-Control-Allow-Origin: *
+  Cache-Control: public, max-age=600
+  X-Content-Type-Options: nosniff

@@ -145,13 +145,32 @@ jobs:
           git commit -m "Update $changed index ($(date -u +%Y-%m-%d))"
           git push origin gh-pages
 
-      - name: Fail the run if a build failed
-        if: steps.videos.outcome == 'failure' || steps.photos.outcome == 'failure' || steps.site.outcome == 'failure' || steps.site.outputs.stale == '1'
+      # The same four files on Cloudflare (cloudflare/wrangler.jsonc: a Worker with static assets only), which the
+      # widgets read first; GitHub Pages stays their fall-back. Every run, so Cloudflare always holds what gh-pages
+      # holds (wrangler uploads only files whose content changed). Without the secret the step only warns.
+      - name: Deploy the published files to Cloudflare
+        id: cloudflare
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::warning::Not deployed to Cloudflare: the repository secret CLOUDFLARE_API_TOKEN is not set (see README, Cloudflare)."
+            exit 0
+          fi
+          rm -rf dist && mkdir dist
+          cp site/videos.json site/photos.json site/site.json site/site-goto.json cloudflare/_headers dist/
+          cd cloudflare && npx --yes wrangler@4.158.0 deploy
+
+      - name: Fail the run if a build or the Cloudflare deploy failed
+        if: steps.videos.outcome == 'failure' || steps.photos.outcome == 'failure' || steps.site.outcome == 'failure' || steps.site.outputs.stale == '1' || steps.cloudflare.outcome == 'failure'
         env:
           VIDEOS: ${{ steps.videos.outcome }}
           PHOTOS: ${{ steps.photos.outcome }}
           SITE: ${{ steps.site.outcome }}
           STALE: ${{ steps.site.outputs.stale }}
+          CLOUDFLARE: ${{ steps.cloudflare.outcome }}
         run: |
-          echo "::error::video build: $VIDEOS, photo build: $PHOTOS, site build: $SITE (stale full walk: ${STALE:-no}). A failed build published nothing; see its step's log."
+          echo "::error::video build: $VIDEOS, photo build: $PHOTOS, site build: $SITE (stale full walk: ${STALE:-no}), Cloudflare deploy: $CLOUDFLARE. A failed build published nothing; a failed deploy left Cloudflare on its previous files. See the step's log."
           exit 1

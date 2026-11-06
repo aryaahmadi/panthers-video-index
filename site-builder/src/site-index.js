@@ -330,6 +330,40 @@
     return { type: type, title: title, url: ORIGIN + path + x.slug + "/", aliases: cleanAliases(x.aliases), sub: sub, order: order };
   }
 
+  // A coach is also found by the job: "head coach", "defensive coordinator" (and "dc"), "quarterbacks coach" (and
+  // "qb coach"). Each part of a combined role counts ("Assistant Head Coach/Run Game Coordinator"); "interim" may be
+  // left out; a part that is no job on its own ("Assistant", "Senior Offensive Consultant") adds nothing. The
+  // matcher takes these whole only (gotoMatcher), so "coaches" is not every coach.
+  var RE_ROLE_SPLIT = new RegExp("\\s*(?:/|&|\\band\\b|\\s-\\s)\\s*");
+  var RE_JOB = new RegExp("\\b(?:head coach|coordinator)\\b");
+  var POSITION_GROUPS = ["quarterbacks", "running backs", "wide receivers", "tight ends", "offensive line", "defensive line",
+                         "linebackers", "inside linebackers", "outside linebackers", "secondary", "cornerbacks", "safeties",
+                         "special teams"];
+  var ROLE_SHORT = { "offensive coordinator": "oc", "defensive coordinator": "dc" };
+  var GROUP_SHORT = { quarterbacks: ["qb"], "running backs": ["rb"], "wide receivers": ["wr", "receivers"], "tight ends": ["te"],
+                      "offensive line": ["ol"], "defensive line": ["dl"], linebackers: ["lb"], cornerbacks: ["cb"],
+                      secondary: ["db", "defensive backs"] };
+  function roleAliases(role) {
+    var out = [];
+    String(role || "").toLowerCase().split(RE_ROLE_SPLIT).forEach(function (part) {
+      part = part.trim();
+      if (!part) return;
+      var plain = part.indexOf("interim ") === 0 ? part.slice(8) : part;
+      if (RE_JOB.test(plain)) {
+        out.push(part);
+        if (plain !== part) out.push(plain);
+        if (ROLE_SHORT[plain]) out.push(ROLE_SHORT[plain]);
+        if (plain === "special teams coordinator") out.push("special teams coach");
+      } else {
+        var group = plain.replace(new RegExp("\\s+coach$"), "");
+        if (POSITION_GROUPS.indexOf(group) === -1) return;
+        out.push(group + " coach");
+        (GROUP_SHORT[group] || []).forEach(function (g) { out.push(g + " coach"); });
+      }
+    });
+    return out;
+  }
+
   function playerSub(p) {
     var bits = [];
     if (typeof p.pos === "string" && /^[A-Z]{1,4}$/.test(p.pos)) bits.push(p.pos);
@@ -355,7 +389,9 @@
       });
       (Array.isArray(json.coaches) ? json.coaches : []).forEach(function (c) {
         var role = c && typeof c.role === "string" && c.role.length <= 80 ? PVI.cleanText(c.role) : "";
-        add(personEntry("coach", c, "/team/coaches-roster/", "Coach" + (role ? " \u00b7 " + role : ""), order++));
+        var e = personEntry("coach", c, "/team/coaches-roster/", "Coach" + (role ? " \u00b7 " + role : ""), order++);
+        if (e && role) e.jobs = cleanAliases(roleAliases(role));
+        add(e);
       });
       (Array.isArray(json.legends) ? json.legends : []).forEach(function (l) {
         var y = l && typeof l.year === "number" && l.year > 1990 && l.year < 2100 ? " \u00b7 " + l.year : "";
@@ -465,9 +501,11 @@
     // Per entry: its title's words and each alias's words. Inside a longer query a page needs a multi-word title
     // or alias ("season tickets" must not make every "... tickets" query a PSL row); a person also matches on a
     // curated one-word nickname ("smitty touchdown").
+    // A coach's job titles (entry.jobs) count only whole: the query is the job, or holds it ("who is the dc").
     var names = entries.map(function (e) {
       var list = [{ w: words(PVS, e.title), alias: false }];
       e.aliases.forEach(function (a) { list.push({ w: words(PVS, a), alias: true }); });
+      (e.jobs || []).forEach(function (a) { list.push({ w: words(PVS, a), alias: true, job: true }); });
       return list;
     });
     return function (query) {
@@ -498,6 +536,7 @@
           if (i < 0) return;
           var best = Infinity;
           names[i].forEach(function (n) {
+            if (n.job) return;
             if (n.w.length && qw.every(function (w) { return n.w.indexOf(w) >= 0; })) best = Math.min(best, Math.max(0, n.w.length - qw.length));
           });
           pick(i, 2, best === Infinity ? 99 : best, r.score);
@@ -540,6 +579,7 @@
     normalizeGoto: normalizeGoto,
     normalizeArchive: normalizeArchive,
     mergeFresh: mergeFresh,
-    gotoMatcher: gotoMatcher
+    gotoMatcher: gotoMatcher,
+    roleAliases: roleAliases
   };
 }));

@@ -1,0 +1,15 @@
+// The published indexes (videos.json, photos.json, site.json, site-goto.json) served from Cloudflare as a Worker
+// with static assets only: no script runs, so requests to them are free and not capped. The hourly Action copies
+// the gh-pages files into ../dist together with _headers and deploys this (.github/workflows/update-index.yml).
+// The account ID is not a secret; the API token the Action deploys with is (repository secret CLOUDFLARE_API_TOKEN).
+{
+  "name": "panthers-search-data",
+  "account_id": "167ad502cd5ed3504b59075297a4eafa",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "assets": {
+    "directory": "../dist",
+    "not_found_handling": "none"
+  }
+}

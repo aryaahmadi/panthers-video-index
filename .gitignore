@@ -6,6 +6,7 @@ __pycache__/
 *.tmp
 *.gz
 site/
+dist/
 sitemap-video-*.xml
 
 # os / editors
