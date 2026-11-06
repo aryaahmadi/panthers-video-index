@@ -6,22 +6,25 @@ for the Panthers video search widget (the `search` project) and can be consumed 
 that wants a list of Panthers videos with titles, dates, thumbnails, descriptions and tags.
 Next to it, the same Action publishes `photos.json`, an index of every photo gallery on
 [panthers.com/photos](https://www.panthers.com/photos/) for the photo search (see
-[Photo index](#photo-index-photosjson)).
+[Photo index](#photo-index-photosjson)), and `site.json` + `site-goto.json` for the site search that replaces the
+header search (see [Site index](#site-index-sitejson-site-gotojson)).
 
-**Live URLs:** `https://aryaahmadi.github.io/panthers-video-index/videos.json` and
-`https://aryaahmadi.github.io/panthers-video-index/photos.json`
+**Live URLs:** `https://aryaahmadi.github.io/panthers-video-index/videos.json`,
+`https://aryaahmadi.github.io/panthers-video-index/photos.json`,
+`https://aryaahmadi.github.io/panthers-video-index/site.json` and
+`https://aryaahmadi.github.io/panthers-video-index/site-goto.json`
 (GitHub Pages, `Access-Control-Allow-Origin: *`, `Cache-Control: max-age=600`, ETag, gzip.)
 
 ## Repository layout
 
 | Branch     | Contents                                                                              |
 |------------|---------------------------------------------------------------------------------------|
-| `main`     | Code: `build-index.py`, `photo-builder/`, the GitHub Action, this README.             |
-| `gh-pages` | Data: `videos.json` and `photos.json` only. GitHub Pages serves this branch.          |
+| `main`     | Code: `build-index.py`, `photo-builder/`, `site-builder/`, the GitHub Action, this README. |
+| `gh-pages` | Data: `videos.json`, `photos.json`, `site.json`, `site-goto.json`. GitHub Pages serves this branch. |
 
 The two branches never share files. The Action checks out `main` for the code and `gh-pages`
-into `site/` for the data, runs both builders and pushes `site/videos.json` and `site/photos.json`
-back to `gh-pages` only when their content changed.
+into `site/` for the data, runs the three builders and pushes the files back to `gh-pages` only
+when their content changed.
 
 ## Index format v2 (`videos.json`)
 
@@ -204,13 +207,14 @@ its tags, photo count and captions. An hourly run costs ~45 requests plus one pa
 unchanged from the `search` project, where they have tests and where the widget runs the same
 parsing code on the live feed: `tools/build-photo-index.js`, `src/photo-index.js` and
 `src/index-normalize.js` (the widget's video-index normaliser, which the parser reuses). Change
-them there, run its tests, and copy them over (from this repo's root, with the `search` project
-cloned next to it); the `cmp` loop prints nothing when the copies are in sync:
+them there, run its tests, commit, and copy them over with the `search` project's sync tool (with it
+cloned next to this repo), which copies both builders and writes each one's `MANIFEST.json` (the
+source commit and every file's sha256); the Action refuses to run a builder whose files do not match
+its manifest (that fails only that builder's step; the other builds still run and publish):
 
 ```bash
-cp ../search/tools/build-photo-index.js photo-builder/tools/
-cp ../search/src/photo-index.js ../search/src/index-normalize.js photo-builder/src/
-for f in tools/build-photo-index.js src/photo-index.js src/index-normalize.js; do cmp ../search/$f photo-builder/$f; done
+node ../search/tools/sync-index-builders.js .           # copy photo-builder/ and site-builder/
+node ../search/tools/sync-index-builders.js . --check   # only report copies that differ
 ```
 
 To run it by hand:
@@ -230,21 +234,60 @@ node photo-builder/tools/build-photo-index.js --out photos.json
 * `--limit N`, `--cache DIR`, `--reparse`, `--refetch`, `--concurrency N`: see the comment at the
   top of `photo-builder/tools/build-photo-index.js`.
 
+## Site index (`site.json`, `site-goto.json`)
+
+For the `search` project's site search (its README has the full story). `site.json` is every news
+article and podcast episode, from the site's "Load More" feed (`/api/lazy/load`, `Type: "stories"` and
+`"audios"`, 100 per request): `{ version: 1, generated, fullAt: { stories, audio }, stories: [{ slug,
+title, date, thumb, desc }], audio: [...] }` (~15,000 + ~2,800 items back to 2009, ~1.5 MB gzip).
+`site-goto.json` (~6 KB) is the "Go to" rows: curated pages (from the `search` project's
+`src/site-pages.json`) plus the site's header/footer menu links on allowed hosts, the roster, coaching
+staff and Hall of Honor, the Popular Pages list and site-only synonyms.
+
+**The builder** is `site-builder/` (copied with `photo-builder/`, see above). Every run reads the first
+page of each feed (stopping at the first page that brings nothing new or changed) and the four Go-to
+pages: 6 requests, about a second. A full walk of a feed (~190 requests for news, ~1 minute) also runs
+when its last complete one (`fullAt.stories` / `fullAt.audio`) is 20+ hours old, or with `--full` (manual
+dispatch: tick "full"); its result is used only when it completes within 6 minutes and does not shrink the
+section by half, and a failed one is retried after 6 hours (`fullTriedAt`), while the newest pages keep
+coming in. A full walk also checks every curated URL and reports any that stops answering 200. Stories and
+podcasts only grow or refresh; players, coaches, Hall of Honor and menu pages are replaced on every read
+that passes its health check and kept as published when it fails (exit code 2, a warning). A feed with no
+complete full walk for 48 hours gives exit code 3: the files are published and the run fails, so someone
+looks.
+
+**First publish.** The Action never passes `--bootstrap`, so `site.json` and `site-goto.json` must be on
+`gh-pages` before the site step lands on `main`: check out `gh-pages`, run
+`node site-builder/tools/build-site-index.js --out-dir <gh-pages checkout> --bootstrap` (one full walk),
+commit both files, push `gh-pages`, then push `main`.
+
+To run it by hand:
+
+```bash
+git show origin/gh-pages:site.json > site.json && git show origin/gh-pages:site-goto.json > site-goto.json
+node site-builder/tools/build-site-index.js --out-dir .
+```
+
 ## Automation
 
-`.github/workflows/update-index.yml` ("Update video and photo index") runs hourly (at :17 past the
-hour) and on manual dispatch (Actions tab -> "Update video and photo index" -> "Run workflow"). It
-installs `requests` and Node 24, runs
-`python3 build-index.py --existing site/videos.json --out site/videos.json` and
-`node photo-builder/tools/build-photo-index.js --out site/photos.json`, and commits + pushes the
-files that changed to `gh-pages` with the built-in `GITHUB_TOKEN` (`permissions: contents: write`)
-only when `git diff` reports a change. GitHub Pages redeploys on push; the CDN cache is 10 minutes.
+`.github/workflows/update-index.yml` ("Update video, photo and site index") runs hourly (at :17 past
+the hour) and on manual dispatch (Actions tab -> "Update video, photo and site index" -> "Run
+workflow"; tick "full" for a full site walk). It installs `requests` and Node 24, runs
+`python3 build-index.py --existing site/videos.json --out site/videos.json`,
+`node photo-builder/tools/build-photo-index.js --out site/photos.json` and
+`node site-builder/tools/build-site-index.js --out-dir site` (each copied builder's step first checks it
+against its `MANIFEST.json`), and commits + pushes the files that changed to `gh-pages` with the built-in
+`GITHUB_TOKEN` (`permissions: contents: write`) only when `git status` reports a change. GitHub Pages
+redeploys on push; the CDN cache is 10 minutes.
 
-The two builds are independent. If one fails, its file is put back as published (so a half-written
-file is never pushed), the other is still published, and the run fails at its last step so the
-failure is visible. The photo build's exit code 2 (some gallery pages could not be read; they are
-retried next run) is a warning, not a failure. The photo builder is stopped after 14 minutes (the
-step itself after 15); a timed-out build counts as failed.
+The three builds are independent. If one fails (a copied builder that no longer matches its
+`MANIFEST.json` fails its own step), its files are put back as published (so a half-written file is never
+pushed), the others are still published, and the run fails at its last step so the failure is visible.
+Exit code 2 from the photo build (some gallery pages could not be read) or the site build (a section kept
+its previous contents) is a warning, not a failure; both are retried next run. Exit code 3 from the site
+build (no complete full walk of a feed for 48 hours) publishes the files and fails the run. The photo
+builder is stopped after 14 minutes (its step after 15), the site builder after 9 (its step after 10); a
+timed-out build counts as failed.
 
 Two things bound freshness: GitHub can start scheduled jobs late (runs meant for 11:00 UTC started
 3-4 hours late in September 2026), and the site's fast-changing sitemap itself can lag a new video by

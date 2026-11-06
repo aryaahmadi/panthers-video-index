@@ -1,9 +1,14 @@
-name: Update video and photo index
+name: Update video, photo and site index
 
 on:
   schedule:
     - cron: "17 * * * *"   # hourly, at :17 (GitHub delays jobs scheduled on the hour); no-change runs commit nothing
   workflow_dispatch:
+    inputs:
+      full:
+        description: "Site index: walk the whole news and podcast feeds (otherwise only when the last full walk is 20+ hours old)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -53,6 +58,18 @@ jobs:
         continue-on-error: true
         timeout-minutes: 15
         run: |
+          # The builder is a copy of files from the search project (tools/sync-index-builders.js writes it with a
+          # MANIFEST.json of their sha256); a copy edited by hand or copied in part fails this step only.
+          node -e '
+            const fs = require("fs"), path = require("path"), crypto = require("crypto"), dir = process.argv[1];
+            const m = JSON.parse(fs.readFileSync(path.join(dir, "MANIFEST.json"), "utf8"));
+            let bad = 0;
+            for (const [f, want] of Object.entries(m.files)) {
+              const got = crypto.createHash("sha256").update(fs.readFileSync(path.join(dir, f))).digest("hex");
+              if (got !== want) { bad++; console.log("::error::" + dir + "/" + f + " does not match its MANIFEST.json (" + m.source + ")"); }
+            }
+            console.log(dir + ": " + Object.keys(m.files).length + " files from " + m.source);
+            process.exit(bad ? 1 : 0);' photo-builder || exit 1
           set +e
           # timeout stops the builder itself before the step's own limit, which only signals this shell: a builder
           # left running could otherwise write photos.json while the commit step runs.
@@ -66,19 +83,61 @@ jobs:
           fi
           exit "$code"
 
+      - name: Build site index (merge into the published site.json and site-goto.json)
+        id: site
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          FULL: ${{ inputs.full && '--full' || '' }}
+        run: |
+          # The builder is a copy of files from the search project (tools/sync-index-builders.js writes it with a
+          # MANIFEST.json of their sha256); a copy edited by hand or copied in part fails this step only.
+          node -e '
+            const fs = require("fs"), path = require("path"), crypto = require("crypto"), dir = process.argv[1];
+            const m = JSON.parse(fs.readFileSync(path.join(dir, "MANIFEST.json"), "utf8"));
+            let bad = 0;
+            for (const [f, want] of Object.entries(m.files)) {
+              const got = crypto.createHash("sha256").update(fs.readFileSync(path.join(dir, f))).digest("hex");
+              if (got !== want) { bad++; console.log("::error::" + dir + "/" + f + " does not match its MANIFEST.json (" + m.source + ")"); }
+            }
+            console.log(dir + ": " + Object.keys(m.files).length + " files from " + m.source);
+            process.exit(bad ? 1 : 0);' site-builder || exit 1
+          set +e
+          # Same reason as above: stop the builder itself before the step's limit.
+          timeout -k 30s 9m node site-builder/tools/build-site-index.js --out-dir site $FULL
+          code=$?
+          # 2: a section (a feed, the roster, the menus, ...) failed its read or its health check. Both files are
+          # complete: that section keeps what was published, the rest is updated, and it is retried (a failed full
+          # walk after 6 hours). 3: also complete, but a section has had no complete full walk for 48 hours: the
+          # files are published and the last step fails the run, so someone looks.
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::A site index section kept its previous contents (see this step's log); retried next run."
+            code=0
+          elif [ "$code" -eq 3 ]; then
+            echo "::error::The site index has had no complete full walk of a feed for 48 hours (see this step's log)."
+            echo "stale=1" >> "$GITHUB_OUTPUT"
+            code=0
+          fi
+          exit "$code"
+
       - name: Commit and push to gh-pages if changed
         working-directory: site
         env:
           VIDEOS: ${{ steps.videos.outcome }}
           PHOTOS: ${{ steps.photos.outcome }}
+          SITE: ${{ steps.site.outcome }}
         run: |
           # A failed build's file goes back to the published one (or away, if it was never published).
           restore() { if git ls-files --error-unmatch -- "$1" >/dev/null 2>&1; then git checkout -- "$1"; else rm -f -- "$1"; fi; }
           [ "$VIDEOS" = success ] || restore videos.json
           [ "$PHOTOS" = success ] || restore photos.json
+          if [ "$SITE" != success ]; then restore site.json; restore site-goto.json; fi
+          # git status, not git diff: a file published for the first time is untracked, and git diff ignores it.
+          differs() { [ -n "$(git status --porcelain -- "$@")" ]; }
           changed="" files=""
-          if ! git diff --quiet -- videos.json; then changed="video"; files="videos.json"; fi
-          if ! git diff --quiet -- photos.json; then changed="${changed:+$changed and }photo"; files="$files photos.json"; fi
+          if differs videos.json; then changed="video"; files="videos.json"; fi
+          if differs photos.json; then changed="${changed:+$changed and }photo"; files="$files photos.json"; fi
+          if differs site.json site-goto.json; then changed="${changed:+$changed and }site"; files="$files site.json site-goto.json"; fi
           [ -n "$changed" ] || exit 0
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -87,10 +146,12 @@ jobs:
           git push origin gh-pages
 
       - name: Fail the run if a build failed
-        if: steps.videos.outcome == 'failure' || steps.photos.outcome == 'failure'
+        if: steps.videos.outcome == 'failure' || steps.photos.outcome == 'failure' || steps.site.outcome == 'failure' || steps.site.outputs.stale == '1'
         env:
           VIDEOS: ${{ steps.videos.outcome }}
           PHOTOS: ${{ steps.photos.outcome }}
+          SITE: ${{ steps.site.outcome }}
+          STALE: ${{ steps.site.outputs.stale }}
         run: |
-          echo "::error::video build: $VIDEOS, photo build: $PHOTOS. A failed build published nothing; see its step's log."
+          echo "::error::video build: $VIDEOS, photo build: $PHOTOS, site build: $SITE (stale full walk: ${STALE:-no}). A failed build published nothing; see its step's log."
           exit 1

@@ -1,0 +1,8 @@
+{
+  "source": "aryaahmadi/panthers-search@6fce284c41f11ed588ffe2a1aace3bffce8ad934",
+  "files": {
+    "tools/build-photo-index.js": "30ac2d4214b4763d313fc231895c3795f8435d7759ec664f6c434892b3be9fd4",
+    "src/photo-index.js": "4f4d8f2c8ba56356c31e9efcfe956e5855949c57c970f3c90248b564f3c82ffb",
+    "src/index-normalize.js": "7cb715e18bb2087f48da229927e4dc5afe8570218c325eb8216146d9407afa0f"
+  }
+}
