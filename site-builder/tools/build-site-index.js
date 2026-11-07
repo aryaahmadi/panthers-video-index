@@ -7,8 +7,8 @@
   site.json       every news article and podcast episode: slug, title, date, thumbnail, summary (~15,000 + ~2,800,
                   back to 2009), from the site's "Load More" feed (/api/lazy/load, Type "stories" / "audios").
   site-goto.json  the "Go to" rows: the curated pages in src/site-pages.json plus every allowed link in the site's
-                  header and footer menus, the roster, the coaching staff and the Hall of Honor, and the curated
-                  synonyms. A few KB; the widget loads it first.
+                  header and footer menus (each with its card: share image and description), the roster, the
+                  coaching staff and the Hall of Honor, and the curated synonyms. ~50 KB (~8 KB compressed); the widget loads it first.
 
   Each section has its own rule:
   - stories, audio: merged into what the file holds. Every run walks the feed from the newest card and stops at
@@ -22,6 +22,13 @@
     fails its check keeps its previous contents.
   - curated pages and synonyms: always the repo's src/site-pages.json (on a full walk each curated URL is checked
     and any that no longer answers 200 is reported).
+  - page cards (thumb, desc on each page): on a full walk, or when the file has none yet (no pageReads), every
+    page is read for its share image (og:image, on the club's image host only) and descriptions, and the last
+    good read of each is kept in pageReads (a page that fails, or is not reached within 90 seconds, keeps its last
+    read; pages never read, then the longest unread, go first). Every run makes the cards from those reads and
+    src/site-pages.json alone: a curated thumb or desc wins, else the page's image and the first description that
+    passes src/site-index.js pageDesc (8+ words, not the site's default, no past season), so taking a curated
+    value out, or a new season, shows on the next run.
   A section that fails keeps what the file held, the rest is written, and the exit code is 2. Every run reads the
   newest feed pages first, so new items keep arriving even while full walks fail; a full walk that fails, runs
   over its 6-minute budget, or returns under half of what a section holds (--force writes it anyway) is not used,
@@ -42,6 +49,7 @@
 const fs = require("fs");
 const path = require("path");
 const S = require("../src/site-index.js");
+const PVI = require("../src/index-normalize.js");
 const CURATED = path.join(__dirname, "..", "src", "site-pages.json");
 
 const ORIGIN = S.ORIGIN;
@@ -51,6 +59,9 @@ const FULL_EVERY_MS = 20 * 3600 * 1000;   // a section's full walk is due this l
 const FULL_RETRY_MS = 6 * 3600 * 1000;    // ... and, after a failed attempt, not again for this long
 const FULL_STALE_MS = 48 * 3600 * 1000;   // no complete full walk for this long: exit 3, the run goes red
 const FULL_BUDGET_MS = 6 * 60 * 1000;     // full walks stop after this (the Action stops the builder at 9 minutes)
+const PAGES_BUDGET_MS = 90 * 1000;        // reading the pages' cards stops after this (the rest keep their last read)
+const RUN_LIMIT_MS = 8 * 60 * 1000;       // ... and by this long after the start (the Action stops the builder at 9 minutes)
+const COMMON_DESC = 3;                    // a description this many pages give is the site's default, not theirs
 const OVERLAP = 5;               // a full walk steps 95 cards at a time, so an item inserted mid-walk is not skipped
 const INCREMENTAL_MAX_PAGES = 10;
 // Pause between requests to panthers.com (ms). tests/site-builder.test.js sets SITE_INDEX_DELAY_MS=0 (its fetch is stubbed).
@@ -240,19 +251,72 @@ function quickPages(curated) {
   });
 }
 
-async function checkCurated(curated) {
-  const bad = [];
-  for (const p of curated.pages || []) {
-    const url = S.allowedUrl(String(p && p.url || ""));
-    if (!url) continue;
+const curatedKey = (p) => S.urlKey(S.allowedUrl(String(p && p.url || "")));
+
+// Reads pages for their cards (S.parsePageMeta) and reports curated URLs that no longer answer 200. Pages never read
+// go first, then the longest since their last read, so a budget that runs out does not leave the same pages unread
+// run after run. Returns urlKey -> { at, thumb, descs } for the pages read now; one that fails, or is not reached in
+// time, is left out (its last read stays).
+async function readPages(pages, curated, prevReads, stopBy) {
+  const read = new Map(), bad = [], deadline = Math.min(Date.now() + PAGES_BUDGET_MS, stopBy);
+  const keys = new Set((curated.pages || []).map(curatedKey));
+  const last = (p) => { const r = prevReads[S.urlKey(p.url)]; return r ? Date.parse(r.at) || 0 : -1; };
+  const order = pages.map((p, i) => [p, i]).sort((a, b) => last(a[0]) - last(b[0]) || a[1] - b[1]).map((x) => x[0]);
+  for (const p of order) {
+    const left = deadline - Date.now();
+    if (left <= 0) {
+      console.warn(`  page cards: out of time with ${read.size} of ${pages.length} pages read (the rest keep their last read)`);
+      break;
+    }
+    const isCurated = keys.has(S.urlKey(p.url));
     try {
-      const r = await fetch(url, { headers: { "User-Agent": UA }, redirect: "manual", signal: AbortSignal.timeout(30000) });
+      const r = await fetch(p.url, { headers: { "User-Agent": UA }, redirect: "manual", signal: AbortSignal.timeout(Math.min(15000, left)) });
       requests++;
-      if (r.status !== 200) bad.push(`${url} -> ${r.status}${r.headers && r.headers.get ? " " + (r.headers.get("location") || "") : ""}`);
-    } catch (e) { bad.push(`${url} -> ${e.message}`); }
+      if (r.status === 200) read.set(S.urlKey(p.url), Object.assign({ at: stamp() }, S.parsePageMeta(await r.text())));
+      else if (isCurated) bad.push(`${p.url} -> ${r.status}${r.headers && r.headers.get ? " " + (r.headers.get("location") || "") : ""}`);
+    } catch (e) { if (isCurated) bad.push(`${p.url} -> ${e.message}`); }
     await sleep(DELAY / 2);
   }
   if (bad.length) console.warn(`  curated pages that no longer answer 200 (fix src/site-pages.json):\n    ${bad.join("\n    ")}`);
+  return read;
+}
+
+// "upload/<id>", or a full URL on the club's image host -> "upload/<id>"; anything else "".
+function compactThumb(t) {
+  t = typeof t === "string" ? t.trim() : "";
+  const c = /^(?:upload|private)\/[A-Za-z0-9_-]+$/.test(t) ? t : PVI.sitemapThumb(t);
+  return /^(?:upload|private)\/[A-Za-z0-9_-]+$/.test(c) ? c : "";
+}
+
+// The last good read of each page still listed: this run's, else the file's (whatever shape the file holds).
+function mergeReads(pages, prevReads, read) {
+  const out = {};
+  for (const p of pages) {
+    const k = S.urlKey(p.url), r = read.get(k) || prevReads[k];
+    if (!r || typeof r !== "object") continue;
+    const thumb = compactThumb(r.thumb), descs = (Array.isArray(r.descs) ? r.descs : []).filter((d) => typeof d === "string" && d);
+    out[k] = Object.assign({ at: typeof r.at === "string" ? r.at : "" }, thumb ? { thumb } : {}, descs.length ? { descs } : {});
+  }
+  return out;
+}
+
+// Each page's card, from its last read and src/site-pages.json alone (never from the previous cards, so a curated
+// value taken out, or a new season, shows on the next run): a curated thumb or desc wins; else the page's share
+// image and the first description of its own (S.pageDesc; one that three or more pages give is the site's default).
+function pageCards(pages, curated, reads, season) {
+  const counts = new Map();
+  for (const r of Object.values(reads)) for (const d of new Set(r.descs || [])) counts.set(d, (counts.get(d) || 0) + 1);
+  const common = new Set([...counts].filter(([, n]) => n >= COMMON_DESC).map(([d]) => d));
+  const cur = new Map((curated.pages || []).map((p) => [curatedKey(p), p]));
+  return pages.map((p) => {
+    const k = S.urlKey(p.url), c = cur.get(k) || {}, r = reads[k] || {};
+    const ownThumb = compactThumb(c.thumb);
+    if (c.thumb && !ownThumb) console.warn(`  curated thumb dropped (not an image on static.clubs.nfl.com): ${c.thumb}`);
+    const ownDesc = typeof c.desc === "string" ? PVI.cleanText(c.desc) : "";
+    const thumb = ownThumb || r.thumb || "";
+    const desc = ownDesc || S.pageDesc(r.descs, common, season);
+    return Object.assign({}, p, thumb ? { thumb } : {}, desc ? { desc } : {});
+  });
 }
 
 // ── Write ───────────────────────────────────────────────────────────────────────────────────────
@@ -338,17 +402,25 @@ async function main() {
   const coaches = await readSection("coaches", "/team/coaches-roster/", S.parseCoaches, (c) => (c.length < 5 ? `only ${c.length} coaches` : ""));
   const legends = await readSection("legends", "/team/hall-of-honor/", S.parseHallOfHonor, (l) => (l.length < 3 ? `only ${l.length} Hall of Honor members` : ""));
   for (const r of [menus, roster, coaches, legends]) if (!r.ok) failed++;
-  if (fullRan) await checkCurated(curated);
 
   const prevMenus = (gotoPrev && gotoPrev.menus) || [];
+  const pages = mergePages(curated, menus.ok ? menus.value : prevMenus);
+  const prevReads = gotoPrev && gotoPrev.pageReads && typeof gotoPrev.pageReads === "object" ? gotoPrev.pageReads : null;
+  const pagesDue = fullRan || !prevReads;
+  const read = pagesDue ? await readPages(pages, curated, prevReads || {}, t0 + RUN_LIMIT_MS) : new Map();
+  if (pagesDue) console.log(`  page cards: ${read.size} of ${pages.length} pages read`);
+  const reads = mergeReads(pages, prevReads || {}, read);
+  // A season runs into February. tests/site-builder.test.js sets SITE_INDEX_TODAY to move the date.
+  const today = new Date(process.env.SITE_INDEX_TODAY || now), season = today.getUTCFullYear() - (today.getUTCMonth() < 2 ? 1 : 0);
   const goto = {
     menus: menus.ok ? menus.value : prevMenus,
-    pages: mergePages(curated, menus.ok ? menus.value : prevMenus),
+    pages: pageCards(pages, curated, reads, season),
     players: applyPeopleAliases(roster.ok ? roster.value.players : (gotoPrev && gotoPrev.players) || [], "player", curated),
     coaches: applyPeopleAliases(coaches.ok ? coaches.value : (gotoPrev && gotoPrev.coaches) || [], "coach", curated),
     legends: applyPeopleAliases(legends.ok ? legends.value : (gotoPrev && gotoPrev.legends) || [], "legend", curated),
     quick: quickPages(curated),
-    synonyms: curated.synonyms || []
+    synonyms: curated.synonyms || [],
+    pageReads: reads
   };
   writeIfChanged(GOTO, gotoPrev, goto,
     `${goto.pages.length} pages, ${goto.players.length} players, ${goto.coaches.length} coaches, ${goto.legends.length} legends`);

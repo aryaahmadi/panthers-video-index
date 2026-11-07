@@ -12,6 +12,8 @@
  *   parseCoaches(html)             -> [{ slug, title, role }]
  *   parseHallOfHonor(html)         -> [{ slug, title, year }]
  *   parseMenus(html)               -> [{ url, title }]   header / footer links on allowed hosts, in page order
+ *   parsePageMeta(html)            -> { thumb: "upload/<id>" | "", descs: [...] }   a page's share image, descriptions
+ *   pageDesc(descs, common, season) -> the description its card shows, or ""
  *   allowedUrl(u)                  -> canonical https URL on an allowed host (see ALLOWED), or ""
  *   normalizeGoto(json)            -> { entries: [{ type, title, url, aliases, sub, order }], quick: [entry],
  *                                       synonyms: [[...]] }
@@ -19,8 +21,9 @@
  *   gotoMatcher(entries, PVS, opts) -> function (query) -> up to 3 entries
  *
  * The published files (written by tools/build-site-index.js, hourly in the index repo):
- *   site-goto.json  { version: 1, generated, pages: [{ url, title, aliases }], players: [...], coaches: [...],
- *                     legends: [...], quick: [page url], synonyms: [[...]] }                  (a few KB)
+ *   site-goto.json  { version: 1, generated, pages: [{ url, title, aliases, related?, thumb?, desc? }], players: [...],
+ *                     coaches: [...], legends: [...], quick: [page url], synonyms: [[...]],
+ *                     pageReads: { urlKey: { at, thumb?, descs? } } (the builder's own; the widget ignores it) }
  *   site.json       { version: 1, generated, fullAt, stories: [{ slug, title, date, thumb, desc }], audio: [...] }
  *
  * Every link the widget renders is built here: pages must pass allowedUrl (an allowlist in this code, never in
@@ -298,6 +301,59 @@
     return out;
   }
 
+  // ── A page's own card: its share image and description ──────────────────────────────────────────
+  // From the page's <meta> tags (either attribute order): og:image (else twitter:image), as "upload/<id>" when it is
+  // on the club's image host and "" otherwise; and the descriptions it gives, og:description first, cleaned,
+  // non-empty and distinct. Which description a card shows is pageDesc's call (it needs every page's).
+  // A tag ends at the first ">" outside quotes; attributes are read one by one (quoted either way, or bare), so a
+  // value holding ">", "name=" or the other quote cannot be mistaken for another attribute.
+  var RE_META = /<meta\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi;
+  var RE_ATTR = /([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  var PAGE_DESC_MIN_WORDS = 8;
+
+  function parsePageMeta(html) {
+    var found = {};
+    if (typeof html === "string") {
+      var end = html.search(/<\/head>/i), head = end === -1 ? html : html.slice(0, end), m;
+      RE_META.lastIndex = 0;
+      while ((m = RE_META.exec(head))) {
+        var attrs = {}, a;
+        RE_ATTR.lastIndex = 5;   // after "<meta"
+        while ((a = RE_ATTR.exec(m[0]))) {
+          var name = a[1].toLowerCase();
+          if (!(name in attrs)) attrs[name] = a[2] != null ? a[2] : a[3] != null ? a[3] : a[4] != null ? a[4] : "";
+        }
+        var key = (attrs.property || attrs.name || "").toLowerCase();
+        if (key && "content" in attrs && !(key in found)) found[key] = PVI.cleanText(attrs.content);
+      }
+    }
+    var img = found["og:image"] || found["og:image:url"] || found["twitter:image"] || found["twitter:image:src"] || "";
+    var thumb = img ? PVI.sitemapThumb(img) : "";
+    if (!/^(?:upload|private)\/[A-Za-z0-9_-]+$/.test(thumb)) thumb = "";
+    var descs = [];
+    [found["og:description"], found["description"]].forEach(function (d) {
+      var t = d ? truncate(d, DESC_MAX) : "";
+      if (t && descs.indexOf(t) === -1) descs.push(t);
+    });
+    return { thumb: thumb, descs: descs };
+  }
+
+  // The description a page card shows: the first of `descs` that says something about this page — 8 words or more,
+  // not one in `common` (the site's default, which many pages share) and naming no season before `season` ("...
+  // home games in 2022"). "" when none does.
+  function pageDesc(descs, common, season) {
+    var list = Array.isArray(descs) ? descs : [];
+    for (var i = 0; i < list.length; i++) {
+      var d = PVI.cleanText(str(list[i]));
+      if (!d || d.split(" ").length < PAGE_DESC_MIN_WORDS) continue;
+      if (common && common.has && common.has(d)) continue;
+      var years = d.match(/\b20\d\d\b/g) || [];
+      if (years.some(function (y) { return +y < season; })) continue;
+      return d;
+    }
+    return "";
+  }
+
   // ── Normalising the published files (widget side) ─────────────────────────────────────────────
   var SUBJECT_MAX = 80, ALIASES_MAX = 24, ALIAS_MAX = 60;
 
@@ -385,7 +441,9 @@
         // related: pages shown right after this one when a query names it exactly (gotoMatcher), gated like any link.
         var related = (Array.isArray(p.related) ? p.related : []).map(function (u) { return allowedUrl(str(u)); })
           .filter(Boolean).slice(0, GOTO_SHOWN - 1);
-        add({ type: "page", title: title, url: url, aliases: cleanAliases(p.aliases), sub: "", order: order++, related: related });
+        // thumb, desc: the page's card when it leads the results (its share image, gated like any thumbnail).
+        add({ type: "page", title: title, url: url, aliases: cleanAliases(p.aliases), sub: "", order: order++, related: related,
+              thumb: thumbIn(p.thumb), desc: truncate(PVI.cleanText(str(p.desc)), DESC_MAX) });
       });
       (Array.isArray(json.players) ? json.players : []).forEach(function (p) {
         add(personEntry("player", p, "/team/players-roster/", p ? playerSub(p) : "", order++));
@@ -593,6 +651,8 @@
     parseCoaches: parseCoaches,
     parseHallOfHonor: parseHallOfHonor,
     parseMenus: parseMenus,
+    parsePageMeta: parsePageMeta,
+    pageDesc: pageDesc,
     labelCase: labelCase,
     normalizeGoto: normalizeGoto,
     normalizeArchive: normalizeArchive,
