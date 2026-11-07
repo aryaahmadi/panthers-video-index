@@ -1,5 +1,5 @@
 {
-  "source": "aryaahmadi/panthers-search@1519017457d5b92ff3ae88c00679fc034e842d5a",
+  "source": "aryaahmadi/panthers-search@b189f08e70cca1e7717e0be041e30a92abafea4e",
   "files": {
     "tools/build-photo-index.js": "30ac2d4214b4763d313fc231895c3795f8435d7759ec664f6c434892b3be9fd4",
     "src/photo-index.js": "4f4d8f2c8ba56356c31e9efcfe956e5855949c57c970f3c90248b564f3c82ffb",

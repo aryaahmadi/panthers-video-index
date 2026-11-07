@@ -382,7 +382,10 @@
         if (!p) return;
         var url = allowedUrl(str(p.url)), title = PVI.cleanText(str(p.title));
         if (!url || !title || title.length > SUBJECT_MAX) return;
-        add({ type: "page", title: title, url: url, aliases: cleanAliases(p.aliases), sub: "", order: order++ });
+        // related: pages shown right after this one when a query names it exactly (gotoMatcher), gated like any link.
+        var related = (Array.isArray(p.related) ? p.related : []).map(function (u) { return allowedUrl(str(u)); })
+          .filter(Boolean).slice(0, GOTO_SHOWN - 1);
+        add({ type: "page", title: title, url: url, aliases: cleanAliases(p.aliases), sub: "", order: order++, related: related });
       });
       (Array.isArray(json.players) ? json.players : []).forEach(function (p) {
         add(personEntry("player", p, "/team/players-roster/", p ? playerSub(p) : "", order++));
@@ -498,6 +501,8 @@
       return { title: keep ? e.title : "", tags: e.aliases.slice(), desc: "", slug: "", date: "", people: [], _e: e };
     });
     var engine = PVS.create(docs, { now: 0, synonyms: opts.synonyms, prefixMaxLen: 3 });
+    var byUrl = {};
+    entries.forEach(function (e) { if (!byUrl[urlKey(e.url)]) byUrl[urlKey(e.url)] = e; });
     // Per entry: its title's words and each alias's words. Inside a longer query a page needs a multi-word title
     // or alias ("season tickets" must not make every "... tickets" query a PSL row); a person also matches on a
     // curated one-word nickname ("smitty touchdown").
@@ -556,7 +561,20 @@
           return o !== e && urlKey(o.url).indexOf(urlKey(e.url) + "/") === 0 && (ro < re || (ro === re && re !== 2));
         });
       });
-      return kept.slice(0, GOTO_SHOWN);
+      // A query that names a page outright: its title or an alias, or one word of 5+ letters spelled a little off
+      // ("tikets", "schedual"; a short word's near miss is too often another word: "hats" -> "CATS"). That page
+      // brings its curated related pages right after it ("tickets": Tickets, Schedule, Single-Game Tickets), and
+      // list.exact tells the search page those rows are its top results.
+      var top = kept[0], out = kept, raw = PVS.tokenize(query || "");
+      var named = !!top && top.type === "page" &&
+        (rankOf.get(top) === 1 || (rankOf.get(top) === 2 && raw.length === 1 && raw[0].length >= 5));
+      if (named && top.related && top.related.length) {
+        var rel = top.related.map(function (u) { return byUrl[urlKey(u)]; }).filter(function (e) { return e && e !== top; });
+        out = [top].concat(rel, kept.slice(1).filter(function (e) { return rel.indexOf(e) === -1; }));
+      }
+      out = out.slice(0, GOTO_SHOWN);
+      Object.defineProperty(out, "exact", { value: named });   // not enumerable: the list stays a plain list
+      return out;
     };
   }
 

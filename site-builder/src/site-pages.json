@@ -3,13 +3,16 @@
     "Curated 'Go to' pages for the site search (KIND site), merged by tools/build-site-index.js into site-goto.json.",
     "Each entry: url (must pass PanthersSiteIndex.allowedUrl, else it is dropped), title (shown), aliases (what fans",
     "type; matched as whole queries, or inside a longer query when 2+ words). A curated entry overrides the menu",
-    "link with the same URL. quick: the 'Popular Pages' shown before a query (curated page URLs, in order).",
+    "link with the same URL. related (optional): up to 2 page URLs shown right after this page when a query names it",
+    "exactly (tickets -> Tickets, then Schedule, Single-Game Tickets). quick: the 'Popular Pages' shown before a query",
+    "(curated page URLs, in order).",
     "synonyms: extra word groups for the content search (src/search-core.js opts.synonyms).",
     "Keep entries to real destinations; the builder warns about any URL that stops answering 200 on a full walk."
   ],
   "pages": [
     { "url": "https://www.panthers.com/schedule/", "title": "Schedule", "aliases": ["schedule", "game schedule", "games", "calendar", "2026 schedule", "season schedule", "next game", "home games", "game times", "kickoff time", "tv schedule", "what channel", "how to watch", "tv channel", "broadcast"] },
-    { "url": "https://www.panthers.com/tickets/", "title": "Tickets", "aliases": ["tickets", "ticket", "buy tickets", "ticket prices"] },
+    { "url": "https://www.panthers.com/tickets/", "title": "Tickets", "aliases": ["tickets", "ticket", "buy tickets", "ticket prices"],
+     "related": ["https://www.panthers.com/schedule/", "https://www.panthers.com/tickets/single"] },
     { "url": "https://www.panthers.com/tickets/single", "title": "Single-Game Tickets", "aliases": ["single game tickets", "game tickets", "individual tickets"] },
     { "url": "https://www.panthers.com/tickets/psls", "title": "Season Tickets & PSLs", "aliases": ["season tickets", "season ticket", "psl", "psls", "permanent seat license", "permanent seat licenses", "season ticket member"] },
     { "url": "https://am.ticketmaster.com/panthers/", "title": "myPanthers Account Manager", "aliases": ["account manager", "mypanthers", "my panthers account", "psl hub", "manage tickets", "transfer tickets", "ticket transfer"] },

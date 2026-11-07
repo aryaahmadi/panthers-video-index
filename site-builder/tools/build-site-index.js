@@ -218,7 +218,9 @@ function mergePages(curated, menus) {
     if (!url) { console.warn(`  curated page dropped (not an allowed URL): ${p && p.url}`); continue; }
     if (seen.has(S.urlKey(url))) continue;
     seen.add(S.urlKey(url));
-    out.push({ url, title: p.title, aliases: p.aliases || [] });
+    const related = (Array.isArray(p.related) ? p.related : []).map((u) => S.allowedUrl(String(u || ""))).filter(Boolean);
+    if (related.length !== (Array.isArray(p.related) ? p.related.length : 0)) console.warn(`  curated related link dropped (not an allowed URL) on ${url}`);
+    out.push(Object.assign({ url, title: p.title, aliases: p.aliases || [] }, related.length ? { related } : {}));
   }
   for (const m of menus) {
     if (seen.has(S.urlKey(m.url))) continue;
