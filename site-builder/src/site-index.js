@@ -12,6 +12,7 @@
  *   parseCoaches(html)             -> [{ slug, title, role }]
  *   parseHallOfHonor(html)         -> [{ slug, title, year }]
  *   parseMenus(html)               -> [{ url, title }]   header / footer links on allowed hosts, in page order
+ *   parseArticlePeople(html)       -> [name]   the players / coaches an article's text links to their roster pages
  *   parsePageMeta(html)            -> { thumb: "upload/<id>" | "", descs: [...] }   a page's share image, descriptions
  *   pageDesc(descs, common, season) -> the description its card shows, or ""
  *   allowedUrl(u)                  -> canonical https URL on an allowed host (see ALLOWED), or ""
@@ -19,12 +20,14 @@
  *                                       synonyms: [[...]] }
  *   normalizeArchive(json)         -> { stories: [item], audio: [item] }  items in the engine's shape
  *   gotoMatcher(entries, PVS, opts) -> function (query) -> up to 3 entries
+ *   personFactor(item, name, now)  -> how much an item about a person gains for a query naming him (by its age)
  *
  * The published files (written by tools/build-site-index.js, hourly in the index repo):
  *   site-goto.json  { version: 1, generated, pages: [{ url, title, aliases, related?, thumb?, desc? }], players: [...],
  *                     coaches: [...], legends: [...], quick: [page url], synonyms: [[...]],
  *                     pageReads: { urlKey: { at, thumb?, descs? } } (the builder's own; the widget ignores it) }
- *   site.json       { version: 1, generated, fullAt, stories: [{ slug, title, date, thumb, desc }], audio: [...] }
+ *   site.json       { version: 1, generated, fullAt, stories: [{ slug, title, date, thumb, desc, people? }], audio: [...] }
+ *                   people: the names an item's text links (absent until the builder has read its page)
  *
  * Every link the widget renders is built here: pages must pass allowedUrl (an allowlist in this code, never in
  * the data, so the data cannot point a "Go to" row anywhere else); stories, podcasts, players, coaches and
@@ -354,6 +357,57 @@
     return "";
   }
 
+  // ── An article's linked players ───────────────────────────────────────────────────────────────
+  // Writers link a player's (or coach's) name in a story or podcast's text to his roster page. Those names are the
+  // article's people (the search finds "claudin" in an article that only names Claudin Cherelus in its text). Only
+  // links inside the article text count (the page's menus and related cards are left out): from its first text block
+  // ("nfl-c-body-part") to the end of the article. The name is the link's title, else its text. At most PEOPLE_MAX.
+  var PEOPLE_MAX = 20, NAME_MAX = 60;
+  var RE_ARTICLE_PERSON = /<a\b([^>]*\bhref="(?:https:\/\/www\.panthers\.com)?\/team\/(?:players|coaches)-roster\/[a-z0-9-]+\/?"[^>]*)>([\s\S]*?)<\/a>/g;
+
+  function parseArticlePeople(html) {
+    var out = [], seen = {};
+    if (typeof html !== "string") return out;
+    var start = html.indexOf("nfl-c-body-part");
+    if (start === -1) return out;
+    var last = html.lastIndexOf("nfl-c-body-part"), stop = html.indexOf("</article>", last);
+    var body = html.slice(start, stop === -1 ? last + 20000 : stop), m;
+    RE_ARTICLE_PERSON.lastIndex = 0;
+    while ((m = RE_ARTICLE_PERSON.exec(body)) && out.length < PEOPLE_MAX) {
+      var ta = RE_TITLE_ATTR.exec(m[1]);
+      var name = htmlText(ta && ta[1] ? PVI.decodeHtml(ta[1]) : m[2]);
+      if (!name || name.length > NAME_MAX || !/[a-z]/i.test(name) || seen[name.toLowerCase()]) continue;
+      seen[name.toLowerCase()] = true;
+      out.push(name);
+    }
+    return out;
+  }
+
+  // For a query naming a current player or coach (the site widget decides): what was written about him lately leads.
+  // A story or podcast whose text links him (people), or any item whose title names him (every word of his name,
+  // "Jr."/"III" aside), gains by its age: x4 today, about x2 at three weeks, x1.2 at two months, nothing after. A
+  // gallery's people are its photo captions (a practice gallery names 30 players), so they do not count here.
+  var NAME_SUFFIX = { jr: 1, sr: 1, ii: 1, iii: 1, iv: 1, v: 1 };
+  function nameWords(s) { return str(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(" ").filter(function (w) { return w && !NAME_SUFFIX[w]; }); }
+
+  function mentionsPerson(item, name) {
+    var want = nameWords(name).join(" ");
+    if (!want || !item) return false;
+    var linked = item.type === "story" || item.type === "audio";
+    var people = linked && Array.isArray(item.people) ? item.people : [];
+    for (var i = 0; i < people.length; i++) if (nameWords(people[i]).join(" ") === want) return true;
+    var title = " " + nameWords(item.title).join(" ") + " ";
+    return nameWords(name).every(function (w) { return title.indexOf(" " + w + " ") !== -1; });
+  }
+
+  function personFactor(item, name, now) {
+    if (!mentionsPerson(item, name)) return 1;
+    var t = Date.parse(str(item.date));
+    if (t !== t) return 1;
+    var days = Math.max(0, (now - t) / 86400000);
+    return days > 120 ? 1 : 1 + 3 * Math.exp(-days / 21);
+  }
+
   // ── Normalising the published files (widget side) ─────────────────────────────────────────────
   var SUBJECT_MAX = 80, ALIASES_MAX = 24, ALIAS_MAX = 60;
 
@@ -495,7 +549,8 @@
         date: date,
         thumb: thumbIn(r.thumb),
         url: ORIGIN + s.path + r.slug,
-        tags: [], people: []
+        // The players its text links (parseArticlePeople, stored by the builder).
+        tags: [], people: cleanAliases(r.people).slice(0, PEOPLE_MAX)
       });
     }
     return out;
@@ -651,6 +706,9 @@
     parseCoaches: parseCoaches,
     parseHallOfHonor: parseHallOfHonor,
     parseMenus: parseMenus,
+    parseArticlePeople: parseArticlePeople,
+    mentionsPerson: mentionsPerson,
+    personFactor: personFactor,
     parsePageMeta: parsePageMeta,
     pageDesc: pageDesc,
     labelCase: labelCase,

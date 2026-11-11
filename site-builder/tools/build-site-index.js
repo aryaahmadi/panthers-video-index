@@ -2,10 +2,11 @@
 /*
   build-site-index.js — builds the site search's two data files. Node 18+, no dependencies.
 
-    node tools/build-site-index.js [--out-dir DIR] [--bootstrap] [--full] [--force]
+    node tools/build-site-index.js [--out-dir DIR] [--bootstrap] [--full] [--force] [--people-minutes N] [--people-only]
 
   site.json       every news article and podcast episode: slug, title, date, thumbnail, summary (~15,000 + ~2,800,
-                  back to 2009), from the site's "Load More" feed (/api/lazy/load, Type "stories" / "audios").
+                  back to 2009), from the site's "Load More" feed (/api/lazy/load, Type "stories" / "audios"), and
+                  the players and coaches its text links to their roster pages (people; see below).
   site-goto.json  the "Go to" rows: the curated pages in src/site-pages.json plus every allowed link in the site's
                   header and footer menus (each with its card: share image and description), the roster, the
                   coaching staff and the Hall of Honor, and the curated synonyms. ~50 KB (~8 KB compressed); the widget loads it first.
@@ -29,6 +30,11 @@
     src/site-pages.json alone: a curated thumb or desc wins, else the page's image and the first description that
     passes src/site-index.js pageDesc (8+ words, not the site's default, no past season), so taking a curated
     value out, or a new season, shows on the next run.
+  - people (players linked in an item's text): each run reads the pages of items not read yet, newest first, three
+    at a time, for --people-minutes (2 by default, within the run's 8 minutes): src/site-index.js
+    parseArticlePeople. An item keeps its people when its card changes. A page that is gone gets [] (nothing to
+    read again); one that fails otherwise stays unread and is tried next run. --people-only does only this (no feed,
+    no Go-to pages), for a long catch-up run of the back catalogue.
   A section that fails keeps what the file held, the rest is written, and the exit code is 2. Every run reads the
   newest feed pages first, so new items keep arriving even while full walks fail; a full walk that fails, runs
   over its 6-minute budget, or returns under half of what a section holds (--force writes it anyway) is not used,
@@ -40,6 +46,8 @@
   --bootstrap     allow site.json not to exist yet (the first build, which is a full walk)
   --full          walk the whole of both feeds
   --force         write a section even when its full walk shrank by more than half
+  --people-minutes N   read article pages for their linked players for N minutes (default 2)
+  --people-only   only read article pages for their players (site.json must exist; site-goto.json is untouched)
 
   The parsing and URL rules live in src/site-index.js, which the widget also runs (on the live feed at page load,
   and to gate every link it shows), so the builder and the page can never disagree about a card or a URL.
@@ -62,20 +70,24 @@ const FULL_BUDGET_MS = 6 * 60 * 1000;     // full walks stop after this (the Act
 const PAGES_BUDGET_MS = 90 * 1000;        // reading the pages' cards stops after this (the rest keep their last read)
 const RUN_LIMIT_MS = 8 * 60 * 1000;       // ... and by this long after the start (the Action stops the builder at 9 minutes)
 const COMMON_DESC = 3;                    // a description this many pages give is the site's default, not theirs
+const PEOPLE_WORKERS = 3;                 // article pages read at once for their players
 const OVERLAP = 5;               // a full walk steps 95 cards at a time, so an item inserted mid-walk is not skipped
 const INCREMENTAL_MAX_PAGES = 10;
 // Pause between requests to panthers.com (ms). tests/site-builder.test.js sets SITE_INDEX_DELAY_MS=0 (its fetch is stubbed).
 const DELAY = process.env.SITE_INDEX_DELAY_MS != null ? Math.max(0, +process.env.SITE_INDEX_DELAY_MS || 0) : 200;
-const USAGE = "usage: node tools/build-site-index.js [--out-dir DIR] [--bootstrap] [--full] [--force]   " +
+const USAGE = "usage: node tools/build-site-index.js [--out-dir DIR] [--bootstrap] [--full] [--force] [--people-minutes N] [--people-only]   " +
               "(see the comment at the top of this file)";
 
 const args = parseArgs(process.argv.slice(2));
 const DIR = path.resolve(args["out-dir"] || path.join(__dirname, ".."));
 const SITE = path.join(DIR, "site.json");
 const GOTO = path.join(DIR, "site-goto.json");
+// How long article pages are read for their players. tests/site-builder.test.js sets SITE_INDEX_PEOPLE_MS (0: none).
+const PEOPLE_BUDGET_MS = process.env.SITE_INDEX_PEOPLE_MS != null ? Math.max(0, +process.env.SITE_INDEX_PEOPLE_MS || 0)
+  : args["people-minutes"] != null ? Math.max(0, +args["people-minutes"] || 0) * 60000 : 2 * 60000;
 
 function parseArgs(argv) {
-  const out = {}, flags = ["bootstrap", "full", "force"], values = ["out-dir"];
+  const out = {}, flags = ["bootstrap", "full", "force", "people-only"], values = ["out-dir", "people-minutes"];
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--help" || argv[i] === "-h") { console.log(USAGE); process.exit(0); }
     const m = argv[i].match(/^--([a-z-]+)(?:=(.*))?$/);
@@ -125,6 +137,16 @@ function compact(c) {
   return o;
 }
 const same = (a, b) => JSON.stringify(compact(a)) === JSON.stringify(compact(b));
+// What the file stores for an item: its card, and once its page has been read the names its text links (people,
+// possibly []). Kept apart from compact so a card from the feed (which has no people) still compares as unchanged.
+// reread: its card changed since its page was read (a writer who edits a post may have linked another player); the
+// next run reads it again, keeping the people it has meanwhile.
+function stored(c, people, reread) {
+  const o = compact(c);
+  if (Array.isArray(people)) o.people = people.filter((n) => typeof n === "string" && n).slice(0, 20);
+  if (reread && o.people) o.reread = 1;
+  return o;
+}
 
 // The feed's last page says so (data-hasnextpage="false"); past the end it answers 200 with an empty body, which
 // is why an empty page is never taken for the end.
@@ -185,9 +207,11 @@ function mergeSection(prev, cards) {
   const entries = cards.map((c) => {
     walked.add(c.slug);
     const p = byPrev.get(c.slug) || {};
-    return compact({ slug: c.slug, title: c.title, date: c.date || p.date, thumb: c.thumb || p.thumb, desc: c.desc || p.desc });
+    const card = { slug: c.slug, title: c.title, date: c.date || p.date, thumb: c.thumb || p.thumb, desc: c.desc || p.desc };
+    // Changed: what is kept differs from the file's (not just from the bare card, which may lack a summary).
+    return stored(card, p.people, p.reread || (!!p.slug && !same(p, card)));
   });
-  for (const x of prev) if (!walked.has(x.slug)) entries.push(compact(x));
+  for (const x of prev) if (!walked.has(x.slug)) entries.push(stored(x, x.people, x.reread));
   const feedPos = new Map(entries.map((e, i) => [e.slug, i]));
   const rank = (e) => (prevPos.has(e.slug) ? entries.length + prevPos.get(e.slug) : feedPos.get(e.slug));
   entries.sort((a, b) => (b.date || "").localeCompare(a.date || "") || rank(a) - rank(b));
@@ -319,6 +343,51 @@ function pageCards(pages, curated, reads, season) {
   });
 }
 
+// ── An item's linked players ────────────────────────────────────────────────────────────────────
+// Reads the pages of items not read yet (no people) or to read again (reread), newest first, PEOPLE_WORKERS at a
+// time, until `deadline`. Each gets the names its text links (S.parseArticlePeople; [] for none, or for a page that
+// is gone). A page that fails otherwise is left as it was and read next run. The site saying "slow down" (429, 403)
+// or PEOPLE_FAILS failures in a row ends the reading for this run.
+const PEOPLE_FAILS = 5;
+async function readPeople(sections, deadline) {
+  const todo = [];
+  for (const name of ["stories", "audio"]) {
+    for (const x of sections[name]) if (!Array.isArray(x.people) || x.reread) todo.push({ x, path: S.SECTIONS[name].path });
+  }
+  todo.sort((a, b) => (b.x.date || "").localeCompare(a.x.date || ""));
+  let next = 0, read = 0, named = 0, fails = 0, stop = "";
+  const statuses = {};
+  const work = async () => {
+    while (next < todo.length && Date.now() < deadline && !stop) {
+      const t = todo[next++];
+      let status = "error";
+      try {
+        const left = deadline - Date.now();
+        const r = await fetch(ORIGIN + t.path + t.x.slug, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(Math.max(1000, Math.min(20000, left))) });
+        requests++;
+        status = r.status;
+        if (r.status === 200) { t.x.people = S.parseArticlePeople(await r.text()); delete t.x.reread; read++; if (t.x.people.length) named++; }
+        else {
+          if (r.body && r.body.cancel) r.body.cancel().catch(() => {});
+          if (r.status === 404 || r.status === 410) { t.x.people = []; delete t.x.reread; read++; }
+        }
+      } catch (e) { /* timed out or failed: read next run */ }
+      statuses[status] = (statuses[status] || 0) + 1;
+      if (status === 429 || status === 403) stop = "the site answered " + status;
+      else if (status === 200 || status === 404 || status === 410) fails = 0;
+      else if (++fails >= PEOPLE_FAILS) stop = PEOPLE_FAILS + " failures in a row";
+      await sleep(DELAY / 2);
+    }
+  };
+  if (todo.length && deadline > Date.now()) await Promise.all(Array.from({ length: PEOPLE_WORKERS }, work));
+  const left = todo.filter((t) => !Array.isArray(t.x.people) || t.x.reread).length;
+  if (todo.length) {
+    console.log(`  players: ${read} pages read (${named} link players), ${left} still to read` + (stop ? `; stopped: ${stop}` : "") +
+                ` (answers: ${JSON.stringify(statuses)})`);
+  }
+  if (stop) console.warn(`  players: stopped reading article pages, ${stop}; the rest are read next run`);
+}
+
 // ── Write ───────────────────────────────────────────────────────────────────────────────────────
 function stamp() { return new Date().toISOString().replace(/\.\d+Z$/, "Z"); }
 
@@ -351,13 +420,25 @@ async function main() {
   const now = Date.now(), deadline = now + FULL_BUDGET_MS, ms = (v) => Date.parse(v || "") || 0;
   console.log(`site index: ${site ? `${site.stories.length} stories, ${site.audio.length} podcasts, last full walks ${JSON.stringify(fullAt)}` : "none (bootstrap)"}`);
 
+  if (args["people-only"]) {
+    if (!site) fail("--people-only needs an existing site.json");
+    const only = { stories: site.stories.filter((x) => x && x.slug).map((x) => stored(x, x.people)),
+                   audio: site.audio.filter((x) => x && x.slug).map((x) => stored(x, x.people)) };
+    await readPeople(only, Date.now() + PEOPLE_BUDGET_MS);
+    const body = Object.assign({}, site, { stories: only.stories, audio: only.audio });
+    delete body.version; delete body.generated;
+    writeIfChanged(SITE, site, body, `${body.stories.length} stories, ${body.audio.length} podcasts`);
+    console.log(`done: ${requests} requests, ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+    return;
+  }
+
   // Every run walks the newest pages first, so new items arrive whatever a full walk does; a due full walk then
   // refreshes the whole section, and its cards are merged only when it completes and passes the shrink guard.
   let failed = 0, stale = 0, fullRan = false;
   const sections = {};
   for (const name of ["stories", "audio"]) {
     const prev = site ? site[name].filter((x) => x && x.slug) : [];
-    let merged = prev.map(compact);
+    let merged = prev.map((x) => stored(x, x.people, x.reread));
     if (prev.length) {
       try {
         const cards = await walkIncremental(name, new Map(prev.map((x) => [x.slug, x])));
@@ -424,6 +505,9 @@ async function main() {
   };
   writeIfChanged(GOTO, gotoPrev, goto,
     `${goto.pages.length} pages, ${goto.players.length} players, ${goto.coaches.length} coaches, ${goto.legends.length} legends`);
+
+  // The players linked in items not read yet, with what is left of the run.
+  await readPeople(sections, Math.min(Date.now() + PEOPLE_BUDGET_MS, t0 + RUN_LIMIT_MS));
 
   // A full walk that changed nothing still records when it ran (so the next one waits 20 h).
   const body = { fullAt, stories: sections.stories, audio: sections.audio };

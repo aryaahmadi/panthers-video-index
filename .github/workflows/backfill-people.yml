@@ -1,0 +1,83 @@
+name: Backfill article players (site search)
+
+# The site search finds an article by the players its text links (site.json "people"). The hourly update reads the
+# pages of new articles for them, 2 minutes a run; this reads the back catalogue (~18,000 pages, ~650 KB each) in
+# long runs. Start it by hand (Actions > this workflow > Run workflow) until its log says nothing is left to read.
+# It shares the hourly update's queue, so while it runs (up to an hour) that hour's update waits; start the next one
+# only after the last has finished (a second one queued behind it would cancel the waiting hourly update). It stops
+# early, and says so, if panthers.com answers 429 or 403.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes to read article pages (at most 50)"
+        type: number
+        default: 45
+
+permissions:
+  contents: write
+
+# The same queue as the hourly update, so the two never write site.json at the same time.
+concurrency:
+  group: update-index
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - name: Check out main (builder code)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Check out gh-pages (published data) into site/
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: site
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Read article pages for their players
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          node -e '
+            const fs = require("fs"), path = require("path"), crypto = require("crypto"), dir = process.argv[1];
+            const m = JSON.parse(fs.readFileSync(path.join(dir, "MANIFEST.json"), "utf8"));
+            let bad = 0;
+            for (const [f, want] of Object.entries(m.files)) {
+              const got = crypto.createHash("sha256").update(fs.readFileSync(path.join(dir, f))).digest("hex");
+              if (got !== want) { bad++; console.log("::error::" + dir + "/" + f + " does not match its MANIFEST.json (" + m.source + ")"); }
+            }
+            process.exit(bad ? 1 : 0);' site-builder
+          m=$(( ${MINUTES:-45} > 50 ? 50 : ${MINUTES:-45} ))
+          # The builder stops itself after $m minutes; timeout is only a backstop.
+          timeout -k 30s $(( m + 4 ))m node site-builder/tools/build-site-index.js --out-dir site --people-only --people-minutes "$m"
+
+      - name: Commit and push site.json to gh-pages if changed
+        working-directory: site
+        run: |
+          [ -n "$(git status --porcelain -- site.json)" ] || { echo "nothing changed"; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add site.json
+          git commit -m "Update site index: article players ($(date -u +%Y-%m-%d))"
+          git push origin gh-pages
+
+      - name: Deploy the published files to Cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::warning::Not deployed to Cloudflare: the repository secret CLOUDFLARE_API_TOKEN is not set."
+            exit 0
+          fi
+          rm -rf dist && mkdir dist
+          cp site/videos.json site/photos.json site/site.json site/site-goto.json cloudflare/_headers dist/
+          cd cloudflare && npx --yes wrangler@4.158.0 deploy
