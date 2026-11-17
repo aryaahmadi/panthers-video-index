@@ -14,6 +14,9 @@
  *   parseMenus(html)               -> [{ url, title }]   header / footer links on allowed hosts, in page order
  *   parseArticlePeople(html)       -> [name]   the players / coaches an article's text links to their roster pages
  *   parsePageMeta(html)            -> { thumb: "upload/<id>" | "", descs: [...] }   a page's share image, descriptions
+ *   parseSitemap(xml)              -> [url]   the sitemap's www.panthers.com pages
+ *   foundSkip(url, season)         -> why a sitemap page is no found page, or ""
+ *   parseFoundPage(html, url)      -> { title, aliases, thumb, img, descs, skip }   a found page's name and card
  *   pageDesc(descs, common, season) -> the description its card shows, or ""
  *   allowedUrl(u)                  -> canonical https URL on an allowed host (see ALLOWED), or ""
  *   normalizeGoto(json)            -> { entries: [{ type, title, url, aliases, sub, order }], quick: [entry],
@@ -25,8 +28,10 @@
  * The published files (written by tools/build-site-index.js, hourly in the index repo):
  *   site-goto.json  { version: 1, generated, pages: [{ url, title, aliases, related?, thumb?, desc? }], players: [...],
  *                     coaches: [...], legends: [...], quick: [page url], synonyms: [[...]],
+ *                     found: [{ url, title, aliases, thumb?, desc?, seen }] (pages new to the sitemap, newest first),
  *                     pageReads: { urlKey: { at, thumb?, descs? } } (the builder's own; the widget ignores it) }
- *   site.json       { version: 1, generated, fullAt, stories: [{ slug, title, date, thumb, desc, people? }], audio: [...] }
+ *   site.json       { version: 1, generated, fullAt, stories: [{ slug, title, date, thumb, desc, people? }], audio: [...],
+ *                     sitemap: { base, seen: { path: date }, reads: { path: {...} } } (the builder's own) }
  *                   people: the names an item's text links (absent until the builder has read its page)
  *
  * Every link the widget renders is built here: pages must pass allowedUrl (an allowlist in this code, never in
@@ -314,25 +319,40 @@
   var RE_ATTR = /([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
   var PAGE_DESC_MIN_WORDS = 8;
 
-  function parsePageMeta(html) {
-    var found = {};
-    if (typeof html === "string") {
-      var end = html.search(/<\/head>/i), head = end === -1 ? html : html.slice(0, end), m;
-      RE_META.lastIndex = 0;
-      while ((m = RE_META.exec(head))) {
-        var attrs = {}, a;
-        RE_ATTR.lastIndex = 5;   // after "<meta"
-        while ((a = RE_ATTR.exec(m[0]))) {
-          var name = a[1].toLowerCase();
-          if (!(name in attrs)) attrs[name] = a[2] != null ? a[2] : a[3] != null ? a[3] : a[4] != null ? a[4] : "";
-        }
-        var key = (attrs.property || attrs.name || "").toLowerCase();
-        if (key && "content" in attrs && !(key in found)) found[key] = PVI.cleanText(attrs.content);
-      }
+  // A tag's attributes, by lower-case name (the first of a repeated one wins). `from` skips the tag's name.
+  function tagAttrs(tag, from) {
+    var attrs = {}, a;
+    RE_ATTR.lastIndex = from;
+    while ((a = RE_ATTR.exec(tag))) {
+      var name = a[1].toLowerCase();
+      if (!(name in attrs)) attrs[name] = a[2] != null ? a[2] : a[3] != null ? a[3] : a[4] != null ? a[4] : "";
     }
-    var img = found["og:image"] || found["og:image:url"] || found["twitter:image"] || found["twitter:image:src"] || "";
-    var thumb = img ? PVI.sitemapThumb(img) : "";
-    if (!/^(?:upload|private)\/[A-Za-z0-9_-]+$/.test(thumb)) thumb = "";
+    return attrs;
+  }
+
+  // The <head>'s <meta> tags: property or name (lower case) -> content (cleaned); the first of each wins.
+  function metaTags(html) {
+    var found = {};
+    if (typeof html !== "string") return found;
+    var end = html.search(/<\/head>/i), head = end === -1 ? html : html.slice(0, end), m;
+    RE_META.lastIndex = 0;
+    while ((m = RE_META.exec(head))) {
+      var attrs = tagAttrs(m[0], 5);   // after "<meta"
+      var key = (attrs.property || attrs.name || "").toLowerCase();
+      if (key && "content" in attrs && !(key in found)) found[key] = PVI.cleanText(PVI.decodeHtml(attrs.content));
+    }
+    return found;
+  }
+
+  // "upload/<id>" for an image on the club's image host, else "".
+  function imageThumb(u) {
+    var thumb = u ? PVI.sitemapThumb(u) : "";
+    return (/^(?:upload|private)\/[A-Za-z0-9_-]+$/).test(thumb) ? thumb : "";
+  }
+
+  function parsePageMeta(html) {
+    var found = metaTags(html);
+    var thumb = imageThumb(found["og:image"] || found["og:image:url"] || found["twitter:image"] || found["twitter:image:src"] || "");
     var descs = [];
     [found["og:description"], found["description"]].forEach(function (d) {
       var t = d ? truncate(d, DESC_MAX) : "";
@@ -341,15 +361,231 @@
     return { thumb: thumb, descs: descs };
   }
 
+  // ── Pages found in the site's sitemap ─────────────────────────────────────────────────────────
+  // panthers.com lists its standalone pages (event pages such as /treelighting2026, promotions, programmes) in
+  // /sitemap.xml with no dates. The builder notes when each URL first appears there; a page that appears after the
+  // first read, passes foundSkip, and whose own text gives it a name (parseFoundPage) is published in
+  // site-goto.json "found" and matched by name only (gotoMatcher). The rules live here so tests and the builder
+  // share them.
+  var FOUND_MAX = 60;              // found pages published (newest first) and read by the widget
+  // Sections the search already covers, or that hold no page worth finding: game centers (the schedule links them),
+  // the site's own forms (password-protected), the retired stadium site.
+  // Partner guest pages (/partnership/: trips, prize pages, RSVPs) and Hall of Fame guests' pages (/legends/) are for
+  // invited people, never the public.
+  var RE_FOUND_COVERED = /^\/(?:news|audio|video|videos|photos|search|sitemap|rss|forms|stadium_old|partnership|legends)(?:\/|$)|^\/team\/(?:players-roster|coaches-roster|hall-of-honor)(?:\/|$)|^\/gameday\/20\d\d(?:\/|$)/;
+  // Pages for a few invited people or staff, or that only collect answers: RSVPs, surveys, feedback, thank-you,
+  // intake, password, form, invite and redemption pages ("fanfestrsvp_browns", "suite-survey-saints",
+  // "psl-owners-thank-you", "diversity-inclusion-staff-form"). The words in the second group count only as whole
+  // words of the address; words that also name fans' pages ("staff", "private", "vip", "request", "application")
+  // are left to the page's own test (parseFoundPage: a page that is only a form).
+  var RE_FOUND_PRIVATE = new RegExp("rsvp|survey|feedback|thank[-_]?you|intake|password|(?:^|[\\/_-])(?:thanks|test|testing|staging|" +
+    "forms?|submissions?|appointments?|nominations?|internal|employees?|invite[sd]?|invitation|accom+odations?|" +
+    "redeem|redemption)(?=$|[\\/_-])");
+  // A copy of another page: in German ("index-de", always), for the app ("action-pack-mobile"), an A/B or numbered
+  // copy ("psls-ab", "front-office-roster_1"). Given the sitemap's paths (foundSkip's `has`), an app, A/B or numbered
+  // address is a copy only when the page it copies is listed ("/mobile-app" copies no "/mobile": a page of its own);
+  // without them, an app ending of the address's last part is taken for a copy.
+  var RE_FOUND_COPY = /^(.+?)[_-](mobile|app|de|ab|copy|old|new|v\d|\d{1,2})$/;
+  var RE_YEAR = /(?:^|[^0-9])(20\d\d)(?![0-9])/g;
+
+  // The sitemap's URLs on www.panthers.com, in its order, each once (by urlKey).
+  function parseSitemap(xml) {
+    var out = [], seen = {}, re = /<loc>\s*([\s\S]*?)\s*<\/loc>/g, m;
+    if (typeof xml !== "string") return out;
+    while ((m = re.exec(xml)) && out.length < 20000) {
+      var url = allowedUrl(PVI.decodeHtml(m[1]).trim());
+      if (!url || url.indexOf(ORIGIN + "/") !== 0 || seen[urlKey(url)]) continue;
+      seen[urlKey(url)] = true;
+      out.push(url);
+    }
+    return out;
+  }
+
+  function copyOf(path, has) {
+    var parts = path.split("/");
+    for (var i = parts.length - 1; i >= 1; i--) {
+      var m = RE_FOUND_COPY.exec(parts[i]);
+      if (!m) continue;
+      if (m[2] === "de" && i === parts.length - 1) return true;
+      if (!has) { if (i === parts.length - 1 && (m[2] === "mobile" || m[2] === "app")) return true; continue; }
+      var parent = parts.slice(0, i).join("/");
+      if (has(m[1] === "index" ? parent || "/" : parent + "/" + m[1])) return true;
+    }
+    return false;
+  }
+
+  // Why a sitemap URL is not a found page ("" when it may be one): another host, the home page, a section the
+  // search covers already, a past season's page (a year before `season` in its address), a page for invited people
+  // or staff or that only collects answers, or a copy of another page. has(path): whether the sitemap lists a path
+  // (lower case, no trailing slash), for copies.
+  function foundSkip(url, season, has) {
+    var u = allowedUrl(str(url));
+    if (!u || u.indexOf(ORIGIN + "/") !== 0) return "not on www.panthers.com";
+    var path = urlKey(u.slice(ORIGIN.length)).toLowerCase();
+    if (!path) return "home page";
+    if (RE_FOUND_COVERED.test(path)) return "section the search covers or skips";
+    var y;
+    RE_YEAR.lastIndex = 0;
+    while ((y = RE_YEAR.exec(path))) if (+y[1] < season) return "past season (" + y[1] + ")";
+    if (RE_FOUND_PRIVATE.test(path)) return "RSVP, survey, form or invited guests' page";
+    if (copyOf(path, typeof has === "function" ? has : null)) return "copy of another page";
+    return "";
+  }
+
+  // Site-wide names a title may be, or end with ("... | Carolina Panthers - Panthers.com"): no name of this page.
+  var RE_TITLE_SUFFIX = /\s*[|–—-]\s*(?:the official site of the )?(?:carolina panthers|panthers(?:\.com)?)(?:\s*[|–—-]\s*panthers(?:\.com)?)?\.?\s*$/i;
+  var GENERIC_TITLES = { "": 1, "carolina panthers": 1, "panthers": 1, "panthers.com": 1, "home": 1, "protected page": 1,
+                         "the official site of the carolina panthers": 1 };
+  var SMALL_WORDS = { a: 1, an: 1, and: 1, at: 1, by: 1, "for": 1, "in": 1, of: 1, on: 1, or: 1, the: 1, to: 1, vs: 1, "with": 1 };
+
+  function pageTitle(s) {
+    var t = htmlText(s), prev;
+    do { prev = t; t = t.replace(RE_TITLE_SUFFIX, ""); } while (t !== prev && t);
+    return GENERIC_TITLES[t.toLowerCase()] ? "" : t;
+  }
+
+  function letters(s) { return str(s).toLowerCase().replace(/[^a-z0-9]+/g, ""); }
+
+  // The words of a page's address (its last part), without a year: "treelighting2026" -> ["treelighting"],
+  // "2026-fan-fest" -> ["fan", "fest"]; year: the year it named, or "".
+  function slugWords(url) {
+    var path = urlKey(str(url).slice(ORIGIN.length)), last = path.slice(path.lastIndexOf("/") + 1).toLowerCase(), year = "";
+    var w = last.split(/[-_]+/).map(function (part) {
+      return part.replace(/^(20\d\d)(?=[a-z])|(?:^|([a-z]))(20\d\d)$/, function (m, a, b, c) { year = year || a || c; return b || ""; });
+    }).filter(function (part) { return (/^[a-z0-9]+$/).test(part); });
+    return { words: w, year: year };
+  }
+
+  // The run of a text's words that spells `joined` ("tree", "lighting" for "treelighting"), as the text writes it.
+  function spelledIn(text, joined) {
+    var parts = str(text).split(/([^A-Za-z0-9]+)/), wordsAt = [];
+    for (var i = 0; i < parts.length; i += 2) if (parts[i]) wordsAt.push(i);
+    for (var s = 0; s < wordsAt.length; s++) {
+      var acc = "";
+      for (var e = s; e < wordsAt.length && acc.length < joined.length; e++) {
+        acc += parts[wordsAt[e]].toLowerCase();
+        if (joined.indexOf(acc) !== 0) break;
+        if (acc === joined) return parts.slice(wordsAt[s], wordsAt[e] + 1).join("");
+      }
+    }
+    return "";
+  }
+
+  // Whether a text shares a word of 4+ letters (not a site-wide one) with a page's address: a heading lower down a
+  // page ("Maema Njongmeta" on /heritage-helmet) or a short paragraph ("The Coin Toss") names it only then.
+  function agreesWith(text, joined) {
+    if (!joined) return true;
+    return str(text).toLowerCase().split(/[^a-z0-9]+/).some(function (w) {
+      return w.length >= 4 && !GENERIC[w] && !GENERIC[w.replace(/s$/, "")] && joined.indexOf(w) !== -1;
+    });
+  }
+
+  function titleCase(w) {
+    return w.map(function (x, i) { return i && SMALL_WORDS[x] ? x : x.charAt(0).toUpperCase() + x.slice(1); }).join(" ");
+  }
+
+  // A found page's name and card, from its own HTML: { title, aliases, thumb, img, descs, skip }.
+  //   title   the first that names this page in at most SUBJECT_MAX characters: its share title (og:title), its
+  //           <title>, a heading in <main>, the words of its address as its text writes them ("Tree Lighting" for
+  //           /treelighting2026), a short first paragraph, its first image's alt text, its address's words.
+  //           Site-wide titles ("Carolina Panthers") and their suffixes do not count.
+  //   aliases the address's words as a name ("tree lighting", and "tree lighting 2026" when it names the year),
+  //           or its one word of 4+ letters ("credentials").
+  //   thumb   its share image; img the first image in <main> (for when the share image is the site's logo).
+  //   descs   its paragraphs of 8+ words that are not its headings, then its meta descriptions (pageDesc picks).
+  //   skip    why it is no page to find: "noindex", "password-protected", "no name" ("" otherwise).
+  var IMG_ATTRS = ["src", "data-src", "srcset", "data-srcset"];
+  var RE_FORM_FRAME = new RegExp("<iframe\\b[^>]*\\b(?:data-)?src\\s*=\\s*[\"']?[^\"'\\s>]*(?:formstack\\.com|jotform\\.|" +
+    "docs\\.google\\.com/forms|forms\\.gle|forms\\.office\\.com|forms\\.microsoft\\.com|typeform\\.com|surveymonkey\\.|" +
+    "cognitoforms\\.com|wufoo\\.com|hsforms\\.|smartsheet\\.com/b/form)", "i");
+  // Text only invited guests are meant to read: a friends & family code, an invitation-only event, a prize to claim.
+  var RE_GUESTS_TEXT = /\bfriends (?:&|and) family (?:codes?|tickets?|presale|seating|section|suite|pricing)\b|\binvit(?:ation|e)[- ]only\b|\bcongratulations[!,.]?\s+you(?:['\u2019]ve| have)? won\b/i;
+
+  function parseFoundPage(html, url) {
+    var out = { title: "", aliases: [], thumb: "", img: "", descs: [], skip: "" };
+    if (typeof html !== "string") { out.skip = "no name"; return out; }
+    var meta = metaTags(html);
+    if (/\bnoindex\b/i.test(meta.robots || "")) { out.skip = "noindex"; return out; }
+    var a = html.search(/<main\b/i), b = a === -1 ? -1 : html.indexOf("</main>", a);
+    var main = a === -1 ? "" : html.slice(a, b === -1 ? html.length : b)
+      .replace(/<(script|style|noscript|template)\b[\s\S]*?<\/\1>/gi, " ");
+    if (/<input\b[^>]*\btype\s*=\s*["']?password/i.test(main)) { out.skip = "password-protected"; return out; }
+    var heads = [], top = [], paras = [], m, re = /<h([1-4])\b[^>]*>([\s\S]*?)<\/h\1>/gi;
+    while ((m = re.exec(main)) && heads.length < 12) {
+      var h = htmlText(m[2]);
+      if (!h) continue;
+      heads.push(h);
+      if (m[1] === "1") top.push(h);
+    }
+    re = /<p\b[^>]*>([\s\S]*?)<\/p>/gi;
+    while ((m = re.exec(main)) && paras.length < 12) { var p = htmlText(m[1]); if (p) paras.push(p); }
+    if (heads.some(function (x) { return x.toLowerCase() === "protected page"; })) { out.skip = "password-protected"; return out; }
+    // A page that is only a form (an embedded Formstack, Google, Microsoft... form, or a <form>) with no paragraph of
+    // its own of PAGE_DESC_MIN_WORDS words: a sign-up for staff, partners or invited guests ("Diversity & Inclusion
+    // Staff Lunch Mixer"). A page that says something and also has a form is a page.
+    var prose = paras.some(function (x) { return x.split(" ").length >= PAGE_DESC_MIN_WORDS; });
+    if (!prose && (RE_FORM_FRAME.test(main) || /<form\b/i.test(main))) { out.skip = "only a form"; return out; }
+    if (RE_GUESTS_TEXT.test(htmlText(main))) { out.skip = "for invited guests"; return out; }
+    // The first image in <main> on the club's image host: an <img> or a <picture>'s <source>, whose address is often
+    // only in data-srcset / data-src until the page's script loads it. alt: the first <img>'s.
+    var imgAttrs = null, tags = /<(img|source)\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi;
+    while ((m = tags.exec(main))) {
+      var at = tagAttrs(m[0], m[1].length + 1);
+      if (!imgAttrs && m[1].toLowerCase() === "img") imgAttrs = at;
+      for (var k = 0; !out.img && k < IMG_ATTRS.length; k++) {
+        out.img = imageThumb(PVI.decodeHtml(str(at[IMG_ATTRS[k]])).split(",")[0].trim().split(/\s+/)[0]);
+      }
+      if (out.img && imgAttrs) break;
+    }
+    out.thumb = imageThumb(meta["og:image"] || meta["og:image:url"] || meta["twitter:image"] || "");
+    var alt = htmlText((imgAttrs || {}).alt || "");
+    // An alt text that is a file name ("Email_Header_16x3", "Wk9_FitzGameWinnerSwipe_Headder (3)") names nothing.
+    if (/_|\d{2,}x\d|\.(?:jpe?g|png|gif|webp)\b|^\S+$/i.test(alt)) alt = "";
+
+    var docTitle = htmlText((/<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(html) || [])[1] || "");
+    var sw = slugWords(url), joined = sw.words.join(""), text = [meta["og:title"], docTitle].concat(heads, paras.slice(0, 6), [alt]).join(" • ");
+    var spelled = joined.length >= 4 ? spelledIn(text, joined) : "";
+    var slugName = spelled || (sw.words.length >= 2 && sw.words.every(function (w) { return w.length >= 2; }) ? titleCase(sw.words) : "");
+    var agrees = function (t) { return agreesWith(t, joined); };
+    var shortPara = paras.slice(0, 6).filter(function (x) { return x.split(" ").length >= 2 && !/[.!?:]$/.test(x) && agrees(x); })[0] || "";
+    // The page's own titles first; an h1 next; then its address's words as its text spells them; then other
+    // headings, a short paragraph or the image's alt text that agree with the address; last its address's words.
+    var tries = [pageTitle(meta["og:title"] || ""), pageTitle(docTitle)]
+      .concat(top.slice(0, 2).map(pageTitle), [spelled], heads.slice(0, 6).filter(agrees).map(pageTitle),
+              [pageTitle(shortPara), agrees(alt) ? alt : "", slugName]);
+    out.title = tries.filter(function (t) { return t && t.length <= SUBJECT_MAX; })[0] || "";
+    if (!out.title) { out.skip = "no name"; return out; }
+    // Named only by its address, with no text or image of its own: an empty page ("/rover-2026/tmac-minicamp-feature").
+    if (out.title === slugName && !spelled && !out.img && htmlText(main).length < 40) { out.skip = "empty page"; return out; }
+
+    var names = [];
+    if (slugName) names.push(slugName.toLowerCase());
+    else if (sw.words.length === 1 && /^[a-z]{4,}$/.test(sw.words[0])) names.push(sw.words[0]);
+    if (names.length && sw.year) names.push(names[0] + " " + sw.year);
+    out.aliases = names.filter(function (n) { return n !== out.title.toLowerCase() && n.length <= ALIAS_MAX; });
+
+    var headSet = {};
+    heads.forEach(function (x) { headSet[x.toLowerCase()] = 1; });
+    paras.concat([meta["og:description"], meta.description]).forEach(function (d) {
+      var t = d ? truncate(PVI.cleanText(d), DESC_MAX) : "";
+      if (!t || headSet[t.toLowerCase()] || t.toLowerCase() === out.title.toLowerCase()) return;
+      if (t.split(" ").length >= PAGE_DESC_MIN_WORDS && out.descs.indexOf(t) === -1 && out.descs.length < 4) out.descs.push(t);
+    });
+    return out;
+  }
+
   // The description a page card shows: the first of `descs` that says something about this page — 8 words or more,
-  // not one in `common` (the site's default, which many pages share) and naming no season before `season` ("...
-  // home games in 2022"). "" when none does.
+  // not one in `common` (the site's default, which many pages share) nor one of its wordings ("The official website
+  // of the Carolina Panthers with access to tickets, ..."), and naming no season before `season` ("... home games
+  // in 2022"). "" when none does.
+  var RE_SITE_DESC = /^the official (?:website|web site|site|home ?page) of the carolina panthers\b/i;
+
   function pageDesc(descs, common, season) {
     var list = Array.isArray(descs) ? descs : [];
     for (var i = 0; i < list.length; i++) {
       var d = PVI.cleanText(str(list[i]));
       if (!d || d.split(" ").length < PAGE_DESC_MIN_WORDS) continue;
-      if (common && common.has && common.has(d)) continue;
+      if ((common && common.has && common.has(d)) || RE_SITE_DESC.test(d)) continue;
       var years = d.match(/\b20\d\d\b/g) || [];
       if (years.some(function (y) { return +y < season; })) continue;
       return d;
@@ -512,6 +748,15 @@
         var y = l && typeof l.year === "number" && l.year > 1990 && l.year < 2100 ? " \u00b7 " + l.year : "";
         add(personEntry("legend", l, "/team/hall-of-honor/", "Hall of Honor" + y, order++));
       });
+      // Pages the builder found in the site's sitemap (parseFoundPage): after every other entry, so one listed
+      // above with the same URL wins, and marked `auto`, which gotoMatcher matches by name only.
+      (Array.isArray(json.found) ? json.found : []).slice(0, FOUND_MAX).forEach(function (p) {
+        if (!p) return;
+        var url = allowedUrl(str(p.url)), title = PVI.cleanText(str(p.title));
+        if (!url || url.indexOf(ORIGIN + "/") !== 0 || !title || title.length > SUBJECT_MAX) return;
+        add({ type: "page", auto: true, title: title, url: url, aliases: cleanAliases(p.aliases), sub: "", order: order++,
+              related: [], thumb: thumbIn(p.thumb), desc: truncate(PVI.cleanText(str(p.desc)), DESC_MAX) });
+      });
     }
     // "Popular Pages": the listed page URLs, in that order, as the entries above (so the same gating applies).
     var quick = [], byKey = {};
@@ -607,11 +852,13 @@
   //   3. a person's name, or a multi-word alias, appears inside a longer query ("jaycee horn injury").
   // Ties keep the data's order (menu order). When an entry and a page above it in the URL tree both match
   // ("/team/hall-of-honor" and "/team/hall-of-honor/sam-mills"), only the more specific one is kept.
+  // A page found in the sitemap (entry.auto) matches by name only (1 and 3, not through the engine), so its long
+  // title cannot put it above the results for any query sharing a word with it ("bank of america stadium").
   function gotoMatcher(entries, PVS, opts) {
     opts = opts || {};
     var docs = entries.map(function (e) {
-      var keep = words(PVS, e.title).join(" ");
-      return { title: keep ? e.title : "", tags: e.aliases.slice(), desc: "", slug: "", date: "", people: [], _e: e };
+      var keep = !e.auto && words(PVS, e.title).join(" ");
+      return { title: keep ? e.title : "", tags: e.auto ? [] : e.aliases.slice(), desc: "", slug: "", date: "", people: [], _e: e };
     });
     var engine = PVS.create(docs, { now: 0, synonyms: opts.synonyms, prefixMaxLen: 3 });
     var byUrl = {};
@@ -651,7 +898,7 @@
       if (!res.partial) {
         res.results.forEach(function (r) {
           var i = docs.indexOf(r.video);
-          if (i < 0) return;
+          if (i < 0 || entries[i].auto) return;
           var best = Infinity;
           names[i].forEach(function (n) {
             if (n.job) return;
@@ -668,10 +915,13 @@
       // every query word, so the child adds nothing: "tikets" keeps /tickets/ next to /tickets/psls.
       var rankOf = new Map();
       picks.forEach(function (p) { rankOf.set(entries[p.i], p.rank); });
+      // A found page (auto) below a curated or menu page hides it only when it matched strictly better: a new
+      // "/training-camp/2027-training-camp" named "Training Camp" follows the Training Camp page, never replaces it.
       var kept = list.filter(function (e) {
         return !list.some(function (o) {
           var ro = rankOf.get(o), re = rankOf.get(e);
-          return o !== e && urlKey(o.url).indexOf(urlKey(e.url) + "/") === 0 && (ro < re || (ro === re && re !== 2));
+          return o !== e && urlKey(o.url).indexOf(urlKey(e.url) + "/") === 0 &&
+            (ro < re || (ro === re && re !== 2 && !(o.auto && !e.auto)));
         });
       });
       // A query that names a page outright: its title or an alias, or one word of 5+ letters spelled a little off
@@ -679,8 +929,10 @@
       // brings its curated related pages right after it ("tickets": Tickets, Schedule, Single-Game Tickets), and
       // list.exact tells the search page those rows are its top results.
       var top = kept[0], out = kept, raw = PVS.tokenize(query || "");
-      var named = !!top && top.type === "page" &&
-        (rankOf.get(top) === 1 || (rankOf.get(top) === 2 && raw.length === 1 && raw[0].length >= 5));
+      // A found page (auto) leads only when the query is its name in two words or more ("tree lighting"); named in
+      // one word ("credentials") it stays a Go-to row above the usual Top Results.
+      var named = !!top && top.type === "page" && (top.auto ? rankOf.get(top) === 1 && qw.length >= 2 :
+        rankOf.get(top) === 1 || (rankOf.get(top) === 2 && raw.length === 1 && raw[0].length >= 5));
       if (named && top.related && top.related.length) {
         var rel = top.related.map(function (u) { return byUrl[urlKey(u)]; }).filter(function (e) { return e && e !== top; });
         out = [top].concat(rel, kept.slice(1).filter(function (e) { return rel.indexOf(e) === -1; }));
@@ -709,6 +961,10 @@
     parseArticlePeople: parseArticlePeople,
     mentionsPerson: mentionsPerson,
     personFactor: personFactor,
+    FOUND_MAX: FOUND_MAX,
+    parseSitemap: parseSitemap,
+    foundSkip: foundSkip,
+    parseFoundPage: parseFoundPage,
     parsePageMeta: parsePageMeta,
     pageDesc: pageDesc,
     labelCase: labelCase,

@@ -71,6 +71,11 @@ const PAGES_BUDGET_MS = 90 * 1000;        // reading the pages' cards stops afte
 const RUN_LIMIT_MS = 8 * 60 * 1000;       // ... and by this long after the start (the Action stops the builder at 9 minutes)
 const COMMON_DESC = 3;                    // a description this many pages give is the site's default, not theirs
 const PEOPLE_WORKERS = 3;                 // article pages read at once for their players
+const SITEMAP_MIN = 300;                  // a sitemap listing fewer pages is a bad read (it lists ~1,500)
+const FOUND_BATCH_MAX = 40;               // more pages new to the sitemap at once: a site change, taken as known
+const FOUND_BUDGET_MS = 60 * 1000;        // reading found pages stops after this (the rest are read next run)
+const COMMON_THUMB = 3;                   // a share image this many pages give is the site's logo, not theirs
+const FOUND_READ_MAX = 120;               // found pages read and kept (newest first): 2x those published, as some name nothing
 const OVERLAP = 5;               // a full walk steps 95 cards at a time, so an item inserted mid-walk is not skipped
 const INCREMENTAL_MAX_PAGES = 10;
 // Pause between requests to panthers.com (ms). tests/site-builder.test.js sets SITE_INDEX_DELAY_MS=0 (its fetch is stubbed).
@@ -343,6 +348,135 @@ function pageCards(pages, curated, reads, season) {
   });
 }
 
+// ── Pages found in the sitemap ──────────────────────────────────────────────────────────────────
+// The sitemap has no dates, so a page is new when it first appears there. site.json "sitemap" remembers each path:
+// "" for one known before (the first read, or a batch too large to be new pages), else the day it first appeared.
+// Paths stay remembered after they leave the sitemap: one that comes back keeps that day (a known one stays known).
+function sitemapState(v) {
+  if (!v || typeof v !== "object" || !v.seen || typeof v.seen !== "object") return null;
+  const seen = {}, reads = {};
+  for (const [k, d] of Object.entries(v.seen)) if (typeof d === "string" && (d === "" || /^\d{4}-\d{2}-\d{2}$/.test(d))) seen[k] = d;
+  for (const [k, r] of Object.entries(v.reads || {})) if (r && typeof r === "object") reads[k] = r;
+  return { base: typeof v.base === "string" ? v.base : "", seen, reads };
+}
+
+const pathOf = (url) => S.urlKey(url.slice(ORIGIN.length)) || "/";
+
+function trackSitemap(prev, urls, day) {
+  const paths = urls.map(pathOf);
+  if (!prev) {
+    const seen = {};
+    for (const p of paths) seen[p] = "";
+    console.log(`  sitemap: first read, its ${paths.length} pages taken as known (pages added from now on are found)`);
+    return { state: { base: day, seen, reads: {} }, fresh: [] };
+  }
+  const seen = Object.assign({}, prev.seen), fresh = [...new Set(paths.filter((p) => !(p in seen)))];
+  const batch = fresh.length > FOUND_BATCH_MAX;
+  if (batch) console.warn(`  sitemap: ${fresh.length} pages new at once (more than ${FOUND_BATCH_MAX}), taken as known: a change to the site, not new pages`);
+  else if (fresh.length) console.log(`  sitemap: ${fresh.length} new: ${fresh.join(", ")}`);
+  for (const p of fresh) seen[p] = batch ? "" : day;
+  return { state: { base: prev.base, seen, reads: prev.reads }, fresh: batch ? [] : fresh };
+}
+
+// The sitemap pages that may be found pages: new since the first read, not a curated or menu page, not on the
+// curated skip list (a URL, or a section ending in "/"), and passing S.foundSkip; the newest FOUND_READ_MAX (by the
+// day each first appeared, then sitemap order), so the pages read stay bounded however long the job runs. Pages new
+// this run that do not qualify are reported once.
+function foundCandidates(urls, state, pages, curated, season, fresh) {
+  const listed = new Set(pages.map((p) => S.urlKey(p.url)));
+  const skips = (curated.skip || []).map((u) => S.allowedUrl(String(u || ""))).filter(Boolean);
+  const freshSet = new Set(fresh), out = [], listedPaths = new Set(urls.map((u) => pathOf(u).toLowerCase()));
+  const has = (p) => listedPaths.has(p);   // for S.foundSkip's copies: whether the page a copy copies is listed
+  for (const url of urls) {
+    const path = pathOf(url), day = state.seen[path], k = S.urlKey(url);
+    if (!day) continue;
+    const why = listed.has(k) ? "a curated or menu page"
+      : skips.some((u) => k === S.urlKey(u) || (/\/$/.test(u) && k.indexOf(u) === 0)) ? "on the skip list in src/site-pages.json"
+      : S.foundSkip(url, season, has);
+    if (why) { if (freshSet.has(path)) console.log(`    ${path}: not a found page (${why})`); continue; }
+    out.push({ url, path, seen: day });
+  }
+  const newest = out.map((c, i) => [c, i]).sort((a, b) => (a[0].seen < b[0].seen ? 1 : a[0].seen > b[0].seen ? -1 : a[1] - b[1]))
+    .map((x) => x[0]);
+  if (newest.length > FOUND_READ_MAX) console.log(`  found pages: the ${newest.length - FOUND_READ_MAX} oldest of ${newest.length} left unread (newest ${FOUND_READ_MAX} kept)`);
+  return newest.slice(0, FOUND_READ_MAX);
+}
+
+// Reads found pages for their name and card (S.parseFoundPage): pages never read first, then, when `due` (a full
+// walk), the rest, longest since their last read first. A redirect to the same page (with or without its trailing
+// slash) is followed once; one elsewhere, 404 or 410 is recorded as a skip; any other failure keeps the last read.
+async function readFound(cands, prevReads, due, stopBy) {
+  const reads = {}, deadline = Math.min(Date.now() + FOUND_BUDGET_MS, stopBy);
+  for (const c of cands) if (prevReads[c.path]) reads[c.path] = prevReads[c.path];
+  const last = (c) => (reads[c.path] ? Date.parse(reads[c.path].at) || 0 : -1);
+  const todo = cands.filter((c) => due || !reads[c.path]).sort((a, b) => last(a) - last(b));
+  let n = 0;
+  for (const c of todo) {
+    const left = deadline - Date.now();
+    if (left <= 0) { console.warn(`  found pages: out of time with ${n} of ${todo.length} read (the rest next run)`); break; }
+    const opts = { headers: { "User-Agent": UA }, redirect: "manual", signal: AbortSignal.timeout(Math.min(15000, left)) };
+    let url = c.url;
+    try {
+      let r = await fetch(c.url, opts);
+      requests++;
+      if (r.status >= 300 && r.status < 400) {
+        const to = S.allowedUrl(String((r.headers && r.headers.get && r.headers.get("location")) || ""), c.url);
+        if (to && S.urlKey(to) === S.urlKey(c.url)) { r = await fetch(to, opts); requests++; url = to; }
+        else {
+          const where = !to ? "another site" : to.indexOf(ORIGIN + "/") === 0 ? to.slice(ORIGIN.length) : to;
+          reads[c.path] = { at: stamp(), skip: "moves to " + where };
+          n++;
+          continue;
+        }
+      }
+      // url: the address that answered (with or without the trailing slash the sitemap gave), published as the page's.
+      if (r.status === 200) {
+        // A page held back keeps only why (site.json is public: nothing of a page that is not published).
+        const p = S.parseFoundPage(await r.text(), url);
+        reads[c.path] = p.skip ? { at: stamp(), skip: p.skip } : Object.assign({ at: stamp() }, url !== c.url ? { url } : {}, p);
+        n++;
+      }
+      else if (r.status === 404 || r.status === 410 || (r.status >= 300 && r.status < 400)) { reads[c.path] = { at: stamp(), skip: "HTTP " + r.status }; n++; }
+    } catch (e) { /* kept: tried again next run */ }
+    await sleep(DELAY / 2);
+  }
+  // In candidate order whatever was read this run, so a run that changes nothing writes the same bytes.
+  return Object.fromEntries(cands.filter((c) => reads[c.path]).map((c) => [c.path, reads[c.path]]));
+}
+
+// The published found pages, newest first (S.FOUND_MAX): each read that names its page, with its share image
+// unless that is the site's logo (COMMON_THUMB pages give it), else the first image on the page, and the first
+// description of its own (S.pageDesc; the site's default is one COMMON_DESC pages give).
+function foundCards(cands, reads, pageReads, season) {
+  const descs = new Map(), thumbs = new Map(), bump = (m, k) => m.set(k, (m.get(k) || 0) + 1);
+  for (const r of Object.values(pageReads).concat(Object.values(reads))) {
+    for (const d of new Set(Array.isArray(r.descs) ? r.descs : [])) bump(descs, d);
+    if (r.thumb) bump(thumbs, r.thumb);
+  }
+  const common = new Set([...descs].filter(([, n]) => n >= COMMON_DESC).map(([d]) => d));
+  const out = [];
+  for (const c of cands) {
+    const r = reads[c.path];
+    if (!r || r.skip || typeof r.title !== "string" || !r.title) continue;
+    const own = compactThumb(r.thumb), img = compactThumb(r.img);
+    const thumb = own && (thumbs.get(r.thumb) || 0) < COMMON_THUMB ? own : img;
+    const desc = S.pageDesc(r.descs, common, season);
+    const url = typeof r.url === "string" && S.allowedUrl(r.url) === r.url && S.urlKey(r.url) === S.urlKey(c.url) ? r.url : c.url;
+    out.push(Object.assign({ url, title: r.title, aliases: Array.isArray(r.aliases) ? r.aliases : [] },
+      thumb ? { thumb } : {}, desc ? { desc } : {}, { seen: c.seen }));
+  }
+  return out.sort((a, b) => (a.seen < b.seen ? 1 : a.seen > b.seen ? -1 : 0)).slice(0, S.FOUND_MAX);
+}
+
+// When the sitemap cannot be read: the found pages published before, less any that no longer qualify.
+function keepFound(prev, pages, curated, season) {
+  const listed = new Set(pages.map((p) => S.urlKey(p.url)));
+  const skips = (curated.skip || []).map((u) => S.allowedUrl(String(u || ""))).filter(Boolean);
+  return (Array.isArray(prev) ? prev : []).filter((f) => f && typeof f.url === "string" && !listed.has(S.urlKey(f.url)) &&
+    !skips.some((u) => S.urlKey(f.url) === S.urlKey(u) || (/\/$/.test(u) && S.urlKey(f.url).indexOf(u) === 0)) &&
+    !S.foundSkip(f.url, season));
+}
+
 // ── An item's linked players ────────────────────────────────────────────────────────────────────
 // Reads the pages of items not read yet (no people) or to read again (reread), newest first, PEOPLE_WORKERS at a
 // time, until `deadline`. Each gets the names its text links (S.parseArticlePeople; [] for none, or for a page that
@@ -482,7 +616,9 @@ async function main() {
     (r) => (r.players.length < 40 ? `only ${r.players.length} players` : !r.active ? "no Active table" : ""));
   const coaches = await readSection("coaches", "/team/coaches-roster/", S.parseCoaches, (c) => (c.length < 5 ? `only ${c.length} coaches` : ""));
   const legends = await readSection("legends", "/team/hall-of-honor/", S.parseHallOfHonor, (l) => (l.length < 3 ? `only ${l.length} Hall of Honor members` : ""));
-  for (const r of [menus, roster, coaches, legends]) if (!r.ok) failed++;
+  const sitemap = await readSection("sitemap", "/sitemap.xml", S.parseSitemap,
+    (u) => (u.length < SITEMAP_MIN ? `only ${u.length} pages` : !u.some((x) => S.urlKey(x) === ORIGIN) ? "no home page" : ""));
+  for (const r of [menus, roster, coaches, legends, sitemap]) if (!r.ok) failed++;
 
   const prevMenus = (gotoPrev && gotoPrev.menus) || [];
   const pages = mergePages(curated, menus.ok ? menus.value : prevMenus);
@@ -493,6 +629,25 @@ async function main() {
   const reads = mergeReads(pages, prevReads || {}, read);
   // A season runs into February. tests/site-builder.test.js sets SITE_INDEX_TODAY to move the date.
   const today = new Date(process.env.SITE_INDEX_TODAY || now), season = today.getUTCFullYear() - (today.getUTCMonth() < 2 ? 1 : 0);
+
+  // Pages new to the sitemap (see trackSitemap), read for their names, then published as found pages.
+  let sitemapNow = sitemapState(site && site.sitemap), found;
+  if (sitemap.ok) {
+    const t = trackSitemap(sitemapNow, sitemap.value, today.toISOString().slice(0, 10));
+    const cands = foundCandidates(sitemap.value, t.state, pages, curated, season, t.fresh);
+    t.state.reads = await readFound(cands, t.state.reads || {}, pagesDue, t0 + RUN_LIMIT_MS);
+    found = foundCards(cands, t.state.reads, reads, season);
+    sitemapNow = t.state;
+    const fresh = new Set(t.fresh);
+    for (const c of cands) {
+      const r = t.state.reads[c.path];
+      if (fresh.has(c.path) && r && r.skip) console.log(`    ${c.path}: not a found page (${r.skip})`);
+    }
+    console.log(`  found pages: ${found.length} published` + (found.some((f) => fresh.has(pathOf(f.url))) ?
+      ` (new: ${found.filter((f) => fresh.has(pathOf(f.url))).map((f) => f.title).join("; ")})` : ""));
+  } else {
+    found = keepFound(gotoPrev && gotoPrev.found, pages, curated, season);
+  }
   const goto = {
     menus: menus.ok ? menus.value : prevMenus,
     pages: pageCards(pages, curated, reads, season),
@@ -501,6 +656,7 @@ async function main() {
     legends: applyPeopleAliases(legends.ok ? legends.value : (gotoPrev && gotoPrev.legends) || [], "legend", curated),
     quick: quickPages(curated),
     synonyms: curated.synonyms || [],
+    found,
     pageReads: reads
   };
   writeIfChanged(GOTO, gotoPrev, goto,
@@ -512,6 +668,7 @@ async function main() {
   // A full walk that changed nothing still records when it ran (so the next one waits 20 h).
   const body = { fullAt, stories: sections.stories, audio: sections.audio };
   if (Object.keys(triedAt).length) body.fullTriedAt = triedAt;
+  if (sitemapNow) body.sitemap = sitemapNow;
   writeIfChanged(SITE, site, body, `${body.stories.length} stories, ${body.audio.length} podcasts`);
   console.log(`done: ${requests} requests, ${((Date.now() - t0) / 1000).toFixed(0)}s` + (failed ? `, ${failed} section(s) kept their previous contents` : ""));
   // 3 (stale) wins over 2: both files are complete either way; 3 means a person should look.

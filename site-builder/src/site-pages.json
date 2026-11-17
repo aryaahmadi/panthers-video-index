@@ -9,8 +9,11 @@
     "thumb is an image on static.clubs.nfl.com (its URL, or upload/<id>). quick: the 'Popular Pages' shown before a query",
     "(curated page URLs, in order).",
     "synonyms: extra word groups for the content search (src/search-core.js opts.synonyms).",
-    "Keep entries to real destinations; the builder warns about any URL that stops answering 200 on a full walk."
+    "Keep entries to real destinations; the builder warns about any URL that stops answering 200 on a full walk.",
+    "skip: page URLs (or a section, ending in /) the builder must never publish as found pages: pages that appear in",
+    "panthers.com's sitemap after the builder's first read of it are found by themselves (site-goto.json found)."
   ],
+  "skip": [],
   "pages": [
     { "url": "https://www.panthers.com/schedule/", "title": "Schedule", "aliases": ["schedule", "game schedule", "games", "calendar", "2026 schedule", "season schedule", "next game", "home games", "game times", "kickoff time", "tv schedule", "what channel", "how to watch", "tv channel", "broadcast"] },
     { "url": "https://www.panthers.com/tickets/", "title": "Tickets", "aliases": ["tickets", "ticket", "buy tickets", "ticket prices"],
